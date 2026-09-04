@@ -23,9 +23,11 @@ endpoints whose payload is encrypted before it is persisted to flash.
    a record written by an incompatible format is detected immediately and
    treated as empty (`/print` returns `{"status":"empty"}`), and the next
    `/write` simply overwrites it. Only call `/clear` when you want to wipe the
-   data on purpose:
+   data on purpose — `/clear` is POST-only and demands the exact key pair that
+   the last `/write` returned (its `pk`/`sk` receipt):
    ```sh
-   curl http://192.168.7.1/clear
+   curl -X POST http://192.168.7.1/clear \
+        -d '{"pk":"<the pk from /write>","sk":"<the sk from /write>"}'
    ```
 
 ## Web service API
@@ -36,20 +38,64 @@ contain a `Content-Length` header.
 
 | Method | Path    | Behavior |
 |--------|---------|----------|
-| POST   | `/write` | Sends a JSON form, e.g. `{"name":"alice","value":"hello"}`. The configured fields (`WRITE_FIELDS` in `web_server.c`, default `name` and `value`) are extracted and **encrypted**, then persisted to flash. Returns `{"status":"ok","bytes":N}`. `400` on an invalid/empty body, `413` if the stored data exceeds 2 KiB. |
+| POST   | `/write` | Sends a JSON form, e.g. `{"name":"alice","value":"hello"}`. The configured fields (`WRITE_FIELDS` in `web_server.c`, default `name` and `value`) are extracted and **encrypted**, then persisted to flash. Returns `{"status":"ok","bytes":N,"pk":"<64 hex>","sk":"<64 hex>"}`: `pk`/`sk` are the **clear receipt** of the record just written — keep them. `400` on an invalid/empty body, `413` if the stored data exceeds 2 KiB. |
 | GET    | `/print` | Returns the stored data as `application/json` (decrypted on the fly), or `{"status":"empty"}` if nothing valid is stored. |
-| GET    | `/clear` | Erases the stored data. Returns `{"status":"ok"}`. |
-| any    | other    | `404`. |
+| GET    | `/sign` | Endpoint description: `{"endpoint":"/sign","method":"POST","fields":["challenge","context","timestamp"]}`. |
+| POST   | `/sign` | Ed25519-signs the message `<challenge>:<context>:<timestamp>:device_001` with the firmware's embedded key (migrated from the legacy firmware). Returns `{"signature":"<base64>","timestamp":"<echoed>","device_id":"device_001"}`. `400` on an empty/missing/malformed field. |
+| POST   | `/clear` | Erases the stored data, but **only when the body carries the exact `pk`/`sk`** (hex) that the `/write` of the current record returned, e.g. `{"pk":"...","sk":"..."}`. Exact match → `{"status":"ok"}`; mismatch → `403` and the data stays untouched; missing/malformed pair → `400`; nothing valid stored → `200` (idempotent no-op). |
+| any    | other    | `404`. `GET /clear` is answered `405`: wiping is POST-only so a browser link or an `<img>` can never erase the record. |
 
 Example:
 
 ```sh
 curl -X POST http://192.168.7.1/write -d '{"name":"alice","value":"hello"}'
-#   -> {"status":"ok","bytes":37}
+#   -> {"status":"ok","bytes":32,"pk":"<64 hex chars>","sk":"<64 hex chars>"}
 curl http://192.168.7.1/print
 #   -> {"name":"alice","value":"hello"}
-curl http://192.168.7.1/clear
+curl -X POST http://192.168.7.1/clear \
+     -d '{"pk":"<the pk from /write>","sk":"<the sk from /write>"}'
+#   -> {"status":"ok"}
 ```
+
+**The clear receipt**: every `/write` generates a fresh key pair and returns it
+(hex `pk`/`sk`) in the success response; the device also stores the pair in
+the record header (offsets 36..99, see the layout below). `POST /clear`
+compares the submitted pair byte-for-byte against the header pair and only
+erases on an exact match:
+
+- Only the **most recent `/write`'s** receipt works: a later `/write` rotates
+  the keys, so an older receipt is answered `403`.
+- On a mismatch the data is left completely untouched; `GET /clear` is always
+  `405`.
+- If the receipt is lost, a valid record can no longer be `/clear`ed, but a
+  plain `/write` simply overwrites it (writing needs no receipt).
+
+**Signing endpoint (`/sign`)** — migrated from the legacy firmware: POST a
+JSON form with all three fields `challenge`, `context`, `timestamp`; the
+firmware Ed25519-signs (TweetNaCl `crypto_sign`) the UTF-8 message
+`<challenge>:<context>:<timestamp>:device_001` and answers with the base64
+raw 64-byte signature plus the echoed timestamp and device id:
+
+```sh
+curl -X POST http://192.168.7.1/sign \
+     -d '{"challenge":"abc","context":"login","timestamp":"2024-06-01T12:00:00Z"}'
+# -> {"signature":"<base64 64-byte signature>","timestamp":"2024-06-01T12:00:00Z","device_id":"device_001"}
+```
+
+The signing key is fixed in the firmware image (the same constants as the
+legacy firmware, so existing verifiers keep working): device id
+`device_001`, Ed25519 public key (base64)
+`f/LmPWawjJ9QjK6GniT26UdCcgIEd2tcoy3lbvCThNQ=`. Verify a signature with the
+bundled standard-library tool (RFC 8032, no dependencies):
+
+```sh
+python sign_verify.py 'abc:login:2024-06-01T12:00:00Z:device_001' '<signature from /sign>'
+# OK: signature is valid for this message and key
+```
+
+Only `/sign` responses carry CORS headers and accept the OPTIONS preflight,
+so a browser page on the host can call it; `/write`, `/print` and `/clear`
+deliberately do not, so a random web page cannot read receipts or stored data.
 
 **The 2 KiB limit** applies to the *stored* JSON (field names, quotes and
 braces included), not just the value. With the tool's 9-character `name`, the
@@ -61,10 +107,10 @@ fixed overhead is 31 bytes, so the largest accepted value is
 `\r`, `\t`) are decoded on /write and re-escaped on /print, so they round-trip
 byte for byte; unsupported escapes (such as `\uXXXX`) or malformed JSON are
 rejected with `400` instead of silently corrupting the value.
-**Content-Length**: a malformed value (empty, non-numeric, overflowing)
-returns `400`; a declared length beyond the receive buffer (~3.1 KB) is
-rejected immediately with `413` and the connection closed, instead of hanging
-until the poll timeout.
+**Content-Length**: an empty or non-numeric value returns `400`; an
+overflowing value saturates and is rejected with `413`, as is any declared
+length beyond the receive buffer (~3.1 KB) — in both cases the connection is
+closed immediately instead of hanging until the poll timeout.
 
 ## Storage & encryption
 
@@ -106,7 +152,11 @@ plaintext:
 The secret key is stored alongside the payload (the goal of this feature is
 that the *payload* is never persisted as plaintext, not key secrecy), so the
 protection targets casual flash dumps rather than a determined attacker with
-access to both the flash contents and the firmware.
+access to both the flash contents and the firmware. The same header key pair
+doubles as the `/clear` receipt: `POST /clear` is only honoured when the
+submitted keys byte-match the header pair, which stops stray web requests (an
+accidental link, a drive-by `<img>`) from wiping the record — but not someone
+who can read the flash, since the keys sit in the header next to the data.
 
 ## Memory configuration (`pico_config.h`)
 
@@ -131,17 +181,25 @@ and reports latency (avg/min/max/p50/p95), throughput and failures:
 python stress_test.py                    # 100 cycles: write -> print -> verify
 python stress_test.py -n 500 -s 512      # 500 iterations, 512-byte values
 python stress_test.py -w 4 --mode write  # 4 workers, raw write throughput
+python stress_test.py --mode clear       # wipe using the last /write's receipt
 python stress_test.py --help             # all options
 ```
 
-Its preflight checks the contract (`/clear` then `/print` returns
-`{"status":"empty"}`, oversized `/write` is rejected with `413` and every
-error response must be one clean, parseable JSON document - a regression net
-for response-body framing), verifies JSON-escape round-trips (single worker),
-and binary-searches the real maximum accepted value length (expected
-`~2017`). `-s` above the limit is refused at startup, so a doomed
-configuration cannot produce a stream of `413`s. Note: byte-for-byte
-verification of written data is only meaningful with `--workers 1`.
+Its preflight checks the key-protected clear contract (a `GET /clear` is
+refused with `405`; a probe `/write` must return the `pk`/`sk` receipt; a
+`/clear` with wrong keys is refused with `403` and leaves the data intact; a
+`/clear` with the exact receipt wipes the record, and a repeated `/clear` on
+the now-empty slot stays a `200` no-op), rejects oversized `/write` bodies
+with a clean `413`, requires every error response to be one parseable JSON
+document (a regression net for response-body framing), verifies JSON-escape
+round-trips (single worker) and binary-searches the real maximum accepted
+value length (expected `~2017`). The tool remembers the receipt of every
+successful `/write`, so `--mode clear` wipes what this run wrote; pass
+`--pk`/`--sk` to clear a record written by an earlier session (any such
+record the preflight cannot clear is overwritten by its probe write). `-s`
+above the limit is refused at startup, so a doomed configuration cannot
+produce a stream of `413`s. Note: byte-for-byte verification of written data
+is only meaningful with `--workers 1`.
 
 ## Building
 

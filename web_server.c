@@ -4,9 +4,19 @@
 // which calls tud_task() and sys_check_timeouts().
 //
 // Routes (see web_server.h):
-//   POST /write  -> persist JSON form fields to flash (<= 2 KiB)
+//   POST /write  -> persist JSON form fields to flash (<= 2 KiB). The success
+//                   response carries the fresh pk/sk (hex) that sealed the
+//                   record: that pair is the writer's clear-receipt.
 //   GET  /print  -> return the stored data
-//   GET  /clear  -> erase the stored data
+//   POST /clear  -> erase the stored data, but only when the JSON body's pk/sk
+//                   exactly match the current record's key pair (403 on a
+//                   mismatch; 400 on a missing/malformed pair). A record-less
+//                   slot is wiped as an idempotent no-op. GET /clear -> 405.
+//   GET  /sign   -> endpoint description
+//   POST /sign   -> Ed25519-signs challenge:context:timestamp:device_id with
+//                   the firmware's embedded key (migrated from the legacy
+//                   firmware tree; this path is CORS-enabled for browsers).
+//   OPTIONS /sign -> CORS preflight (200, empty body).
 //
 // Only a very small subset of HTTP is supported (GET/POST, Content-Length for
 // the POST body); a compliant client (curl, a browser, Postman) is sufficient.
@@ -22,6 +32,7 @@
 #include "lwip/tcp.h"
 
 #include "storage.h"
+#include "tweetnacl.h"
 #include "web_server.h"
 
 #define WEB_PORT 80
@@ -187,6 +198,144 @@ static size_t json_append_escaped(char *dst, size_t cap, const char *src) {
 }
 
 // ---------------------------------------------------------------------------
+// hex helpers (key-pair receipt for /write responses and /clear checks)
+// ---------------------------------------------------------------------------
+
+static void bytes_to_hex(const uint8_t *in, size_t n, char *out) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; ++i) {
+        out[2 * i] = hex[in[i] >> 4];
+        out[2 * i + 1] = hex[in[i] & 0xf];
+    }
+    out[2 * n] = '\0';
+}
+
+// Decodes exactly hex_len hex characters (either case) into out_len bytes.
+// hex_len must equal 2 * out_len; any other character returns false.
+static bool hex_to_bytes(const char *hex, size_t hex_len, uint8_t *out, size_t out_len) {
+    if (hex_len != 2 * out_len) {
+        return false;
+    }
+    for (size_t i = 0; i < out_len; ++i) {
+        int hi = -1, lo = -1;
+        char a = hex[2 * i];
+        char b = hex[2 * i + 1];
+        if (a >= '0' && a <= '9') {
+            hi = a - '0';
+        } else if (a >= 'a' && a <= 'f') {
+            hi = a - 'a' + 10;
+        } else if (a >= 'A' && a <= 'F') {
+            hi = a - 'A' + 10;
+        }
+        if (b >= '0' && b <= '9') {
+            lo = b - '0';
+        } else if (b >= 'a' && b <= 'f') {
+            lo = b - 'a' + 10;
+        } else if (b >= 'A' && b <= 'F') {
+            lo = b - 'A' + 10;
+        }
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// base64 helpers (used by the /sign endpoint)
+// ---------------------------------------------------------------------------
+
+static const char b64_alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int b64_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+// Decodes standard base64 (padding and unknown characters tolerated, like the
+// legacy decoder); returns the number of bytes written (never more than cap).
+static size_t base64_decode(const char *in, uint8_t *out, size_t cap) {
+    size_t n = 0;
+    uint32_t buf = 0;
+    unsigned bits = 0;
+    for (; *in && n < cap; ++in) {
+        if (*in == '=') break;
+        int idx = b64_val(*in);
+        if (idx < 0) continue;
+        buf = (buf << 6) | (uint32_t)idx;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[n++] = (uint8_t)((buf >> bits) & 0xff);
+        }
+    }
+    return n;
+}
+
+// Encodes in_len bytes into out (NUL-terminated). out must be at least
+// 4 * ((in_len + 2) / 3) + 1 bytes.
+static void base64_encode(const uint8_t *in, size_t in_len, char *out) {
+    size_t i, j = 0;
+    for (i = 0; i < in_len; i += 3) {
+        uint32_t b = (uint32_t)in[i] << 16;
+        if (i + 1 < in_len) b |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < in_len) b |= in[i + 2];
+        out[j++] = b64_alphabet[(b >> 18) & 0x3f];
+        out[j++] = b64_alphabet[(b >> 12) & 0x3f];
+        out[j++] = (i + 1 < in_len) ? b64_alphabet[(b >> 6) & 0x3f] : '=';
+        out[j++] = (i + 2 < in_len) ? b64_alphabet[b & 0x3f] : '=';
+    }
+    out[j] = '\0';
+}
+
+// ---------------------------------------------------------------------------
+// /sign endpoint (migrated from the legacy firmware/ tree's micro-cilent HTTP
+// server, which exposed the same endpoint on port 80)
+// ---------------------------------------------------------------------------
+//
+//   GET  /sign -> endpoint description
+//   POST /sign -> signs the UTF-8 message
+//                 "<challenge>:<context>:<timestamp>:<device_id>" with the
+//                 Ed25519 key embedded in this firmware (TweetNaCl
+//                 crypto_sign) and answers with the base64 64-byte signature
+//                 plus the echoed timestamp and device id.
+//
+// The key material is fixed in the firmware image, exactly as it was in the
+// legacy firmware, so existing verifiers can keep checking signatures against
+// the same public key:
+//   base64 public key: f/LmPWawjJ9QjK6GniT26UdCcgIEd2tcoy3lbvCThNQ=
+//   device id:         device_001
+
+static const char SIGN_SEED_B64[] = "nWGxne/zWmC6hEr0kuwsxERJxWl7MWkZcDusAxyuf2A=";
+static const char SIGN_PK_B64[] = "f/LmPWawjJ9QjK6GniT26UdCcgIEd2tcoy3lbvCThNQ=";
+static const char DEVICE_ID[] = "device_001";
+
+static uint8_t sign_sk[64]; // TweetNaCl secret key: 32-byte seed || 32-byte pk
+static bool sign_ready = false;
+
+static uint8_t sign_sm[2048]; // crypto_sign output: 64-byte signature || message
+static char sign_b64[96];     // base64 of the 64-byte raw Ed25519 signature
+
+static bool sign_key_init(void) {
+    uint8_t seed[32], pk[32];
+    if (base64_decode(SIGN_SEED_B64, seed, sizeof(seed)) != sizeof(seed) ||
+        base64_decode(SIGN_PK_B64, pk, sizeof(pk)) != sizeof(pk)) {
+        printf("web_server: failed to decode /sign key material\n");
+        return false;
+    }
+    memcpy(sign_sk, seed, 32);
+    memcpy(sign_sk + 32, pk, 32);
+    sign_ready = true;
+    printf("web_server: ed25519 signing key loaded (device %s)\n", DEVICE_ID);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // connection pool
 // ---------------------------------------------------------------------------
 
@@ -212,15 +361,34 @@ static void release_conn(http_conn_t *c) {
 // response / routing
 // ---------------------------------------------------------------------------
 
-static void respond(http_conn_t *c, struct tcp_pcb *pcb, const char *status, const char *body, size_t body_len) {
-    char head[160];
-    int hn = snprintf(head, sizeof(head),
+// cors=true additionally sends the Access-Control-Allow-* headers. Only the
+// /sign endpoint uses this (browser clients POSTing a challenge need to read
+// the signed response); /write, /print and /clear deliberately stay CORS-free
+// so a random web page cannot read receipts or stored data cross-origin.
+static void respond_ex(http_conn_t *c, struct tcp_pcb *pcb, const char *status, const char *body, size_t body_len,
+                       bool cors) {
+    char head[320];
+    int hn;
+    if (cors) {
+        hn = snprintf(head, sizeof(head),
+                      "HTTP/1.1 %s\r\n"
+                      "Content-Type: application/json\r\n"
+                      "Access-Control-Allow-Origin: *\r\n"
+                      "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                      "Access-Control-Allow-Headers: Content-Type\r\n"
+                      "Content-Length: %u\r\n"
+                      "Connection: close\r\n"
+                      "\r\n",
+                      status, (unsigned)body_len);
+    } else {
+        hn = snprintf(head, sizeof(head),
                       "HTTP/1.1 %s\r\n"
                       "Content-Type: application/json\r\n"
                       "Content-Length: %u\r\n"
                       "Connection: close\r\n"
                       "\r\n",
                       status, (unsigned)body_len);
+    }
     if (hn < 0 || (size_t)hn + body_len > sizeof(resp_buf)) {
         tcp_arg(pcb, NULL);
         tcp_abort(pcb);
@@ -247,12 +415,25 @@ static void respond(http_conn_t *c, struct tcp_pcb *pcb, const char *status, con
     }
 }
 
+// Wrappers: plain responses (all endpoints) and CORS responses (/sign only).
+static void respond(http_conn_t *c, struct tcp_pcb *pcb, const char *status, const char *body, size_t body_len) {
+    respond_ex(c, pcb, status, body, body_len, false);
+}
+
+static void respond_cors(http_conn_t *c, struct tcp_pcb *pcb, const char *status, const char *body, size_t body_len) {
+    respond_ex(c, pcb, status, body, body_len, true);
+}
+
 // Convenience wrapper for respond() with fixed string bodies: the length is
 // computed here, so the body and the Content-Length header can never drift
 // apart (they used to be hand-counted magic numbers, several of which were
 // wrong and made memcpy() read past the end of the string literal).
 static void respond_err(http_conn_t *c, struct tcp_pcb *pcb, const char *status, const char *body) {
     respond(c, pcb, status, body, strlen(body));
+}
+
+static void respond_err_cors(http_conn_t *c, struct tcp_pcb *pcb, const char *status, const char *body) {
+    respond_cors(c, pcb, status, body, strlen(body));
 }
 
 static void handle_write(http_conn_t *c, struct tcp_pcb *pcb) {
@@ -322,13 +503,26 @@ static void handle_write(http_conn_t *c, struct tcp_pcb *pcb) {
         respond_err(c, pcb, "413 Payload Too Large", "{\"status\":\"error\",\"error\":\"payload too large\"}");
         return;
     }
-    if (!storage_write((const uint8_t *)stored, o)) {
+    uint8_t pk[32], sk[32];
+    if (!storage_write((const uint8_t *)stored, o, pk, sk)) {
         respond_err(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"flash write failed\"}");
         return;
     }
-    char ok[64];
-    int n = snprintf(ok, sizeof(ok), "{\"status\":\"ok\",\"bytes\":%u}", (unsigned)o);
-    respond(c, pcb, "200 OK", ok, n > 0 ? (size_t)n : 0);
+    // The success response doubles as the writer's receipt: POST /clear only
+    // erases the record when these exact keys are presented again, so the
+    // client must keep them (the device stores them in the record header).
+    char pk_hex[2 * 32 + 1], sk_hex[2 * 32 + 1];
+    bytes_to_hex(pk, sizeof(pk), pk_hex);
+    bytes_to_hex(sk, sizeof(sk), sk_hex);
+    char ok[256];
+    int n = snprintf(ok, sizeof(ok),
+                     "{\"status\":\"ok\",\"bytes\":%u,\"pk\":\"%s\",\"sk\":\"%s\"}",
+                     (unsigned)o, pk_hex, sk_hex);
+    if (n < 0 || (size_t)n >= sizeof(ok)) {
+        respond_err(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"internal error\"}");
+        return;
+    }
+    respond(c, pcb, "200 OK", ok, (size_t)n);
 }
 
 static void handle_print(http_conn_t *c, struct tcp_pcb *pcb) {
@@ -341,9 +535,128 @@ static void handle_print(http_conn_t *c, struct tcp_pcb *pcb) {
     }
 }
 
+static void handle_sign_info(http_conn_t *c, struct tcp_pcb *pcb) {
+    respond_err_cors(c, pcb, "200 OK",
+                     "{\"endpoint\":\"/sign\",\"method\":\"POST\",\"fields\":[\"challenge\",\"context\",\"timestamp\"]}");
+}
+
+static void handle_sign(http_conn_t *c, struct tcp_pcb *pcb) {
+    if (!sign_ready) {
+        respond_err_cors(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"signing key not initialized\"}");
+        return;
+    }
+    const char *json = (const char *)c->buf + c->body_start;
+    size_t jlen = c->content_length;
+    if (jlen == 0) {
+        respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"empty body\"}");
+        return;
+    }
+
+    // Same three fields and the same per-field caps as the legacy firmware.
+    static const struct {
+        const char *key;
+        size_t cap;
+    } sign_fields[] = {
+        {"challenge", 256},
+        {"context", 128},
+        {"timestamp", 128},
+    };
+    char vals[3][256]; // sized to the largest cap above
+    for (size_t i = 0; i < 3; ++i) {
+        json_field_result_t r = json_get_string(json, jlen, sign_fields[i].key, vals[i], sign_fields[i].cap);
+        if (r == JSON_FIELD_INVALID) {
+            respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"malformed json body\"}");
+            return;
+        }
+        if (r != JSON_FIELD_FOUND) {
+            char err[96];
+            int n = snprintf(err, sizeof(err), "{\"status\":\"error\",\"error\":\"missing field: %s\"}",
+                             sign_fields[i].key);
+            if (n < 0 || (size_t)n >= sizeof(err)) {
+                respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"bad request\"}");
+            } else {
+                respond_cors(c, pcb, "400 Bad Request", err, (size_t)n);
+            }
+            return;
+        }
+    }
+
+    // Message format (legacy-compatible): challenge:context:timestamp:device_id
+    char msg[1024];
+    int msg_len = snprintf(msg, sizeof(msg), "%s:%s:%s:%s", vals[0], vals[1], vals[2], DEVICE_ID);
+    if (msg_len < 0 || (size_t)msg_len >= sizeof(msg)) {
+        respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"message too long\"}");
+        return;
+    }
+
+    unsigned long long smlen = 0;
+    crypto_sign(sign_sm, &smlen, (const unsigned char *)msg, (unsigned long long)msg_len, sign_sk);
+    if (smlen < 64) {
+        respond_err_cors(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"signing failed\"}");
+        return;
+    }
+    base64_encode(sign_sm, 64, sign_b64); // Ed25519 signature = first 64 bytes
+
+    char out[256];
+    int n = snprintf(out, sizeof(out),
+                     "{\"signature\":\"%s\",\"timestamp\":\"%s\",\"device_id\":\"%s\"}",
+                     sign_b64, vals[2], DEVICE_ID);
+    if (n < 0 || (size_t)n >= sizeof(out)) {
+        respond_err_cors(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"internal error\"}");
+        return;
+    }
+    respond_cors(c, pcb, "200 OK", out, (size_t)n);
+}
+
 static void handle_clear(http_conn_t *c, struct tcp_pcb *pcb) {
-    bool ok = storage_clear();
-    respond_err(c, pcb, "200 OK", ok ? "{\"status\":\"ok\"}" : "{\"status\":\"error\"}");
+    // No valid record (empty slot, or a foreign/incompatible format that is
+    // already treated as empty): nothing is protected here, so wiping is an
+    // idempotent no-op that needs no key pair.
+    if (!storage_available()) {
+        respond_err(c, pcb, "200 OK", storage_clear() ? "{\"status\":\"ok\"}" : "{\"status\":\"error\"}");
+        return;
+    }
+
+    // A valid record is stored: erasing it demands the exact key pair that
+    // the /write of that record returned as its receipt.
+    const char *json = (const char *)c->buf + c->body_start;
+    size_t jlen = c->content_length;
+    if (jlen == 0) {
+        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"missing key pair\"}");
+        return;
+    }
+
+    char pk_s[2 * 32 + 1], sk_s[2 * 32 + 1];
+    json_field_result_t rp = json_get_string(json, jlen, "pk", pk_s, sizeof(pk_s));
+    json_field_result_t rs = json_get_string(json, jlen, "sk", sk_s, sizeof(sk_s));
+    if (rp == JSON_FIELD_INVALID || rs == JSON_FIELD_INVALID) {
+        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"malformed json body\"}");
+        return;
+    }
+    if (rp != JSON_FIELD_FOUND || rs != JSON_FIELD_FOUND) {
+        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"missing key pair\"}");
+        return;
+    }
+    if (strlen(pk_s) != 2 * 32 || strlen(sk_s) != 2 * 32) {
+        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"bad key encoding\"}");
+        return;
+    }
+
+    uint8_t pk[32], sk[32];
+    if (!hex_to_bytes(pk_s, 2 * 32, pk, sizeof(pk)) || !hex_to_bytes(sk_s, 2 * 32, sk, sizeof(sk))) {
+        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"bad key encoding\"}");
+        return;
+    }
+    if (!storage_keys_match(pk, sk)) {
+        // Data is left untouched: only the receipt holder may wipe the record.
+        respond_err(c, pcb, "403 Forbidden", "{\"status\":\"error\",\"error\":\"key pair mismatch\"}");
+        return;
+    }
+    if (!storage_clear()) {
+        respond_err(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"flash erase failed\"}");
+        return;
+    }
+    respond_err(c, pcb, "200 OK", "{\"status\":\"ok\"}");
 }
 
 static void handle_request(http_conn_t *c, struct tcp_pcb *pcb) {
@@ -351,8 +664,30 @@ static void handle_request(http_conn_t *c, struct tcp_pcb *pcb) {
         handle_write(c, pcb);
     } else if (strcmp(c->method, "GET") == 0 && strcmp(c->path, "/print") == 0) {
         handle_print(c, pcb);
-    } else if (strcmp(c->method, "GET") == 0 && strcmp(c->path, "/clear") == 0) {
-        handle_clear(c, pcb);
+    } else if (strcmp(c->path, "/sign") == 0) {
+        // Ed25519 signing endpoint (see the section above). Browser clients
+        // need CORS, so this path answers with Access-Control-Allow-* headers
+        // and accepts the OPTIONS preflight; the data endpoints (/write,
+        // /print, /clear) intentionally stay CORS-free.
+        if (strcmp(c->method, "POST") == 0) {
+            handle_sign(c, pcb);
+        } else if (strcmp(c->method, "GET") == 0) {
+            handle_sign_info(c, pcb);
+        } else if (strcmp(c->method, "OPTIONS") == 0) {
+            respond_cors(c, pcb, "200 OK", "", 0);
+        } else {
+            respond_err_cors(c, pcb, "405 Method Not Allowed",
+                             "{\"status\":\"error\",\"error\":\"POST /sign with challenge, context and timestamp\"}");
+        }
+    } else if (strcmp(c->path, "/clear") == 0) {
+        // /clear wipes stored data, so it is key-protected and POST-only: a
+        // plain GET (e.g. a browser <img> or an accidental link) must never
+        // be able to erase the record.
+        if (strcmp(c->method, "POST") == 0) {
+            handle_clear(c, pcb);
+        } else {
+            respond_err(c, pcb, "405 Method Not Allowed", "{\"status\":\"error\",\"error\":\"POST /clear with the key pair from the last /write\"}");
+        }
     } else {
         respond_err(c, pcb, "404 Not Found", "{\"status\":\"error\",\"error\":\"not found\"}");
     }
@@ -577,6 +912,13 @@ static err_t web_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
 }
 
 bool web_server_init(void) {
+    // The /sign endpoint needs the embedded Ed25519 key: refuse to start the
+    // server (and report it) when the key material cannot be loaded.
+    if (!sign_key_init()) {
+        printf("web_server: /sign key unavailable, not starting\n");
+        return false;
+    }
+
     struct tcp_pcb *pcb = tcp_new();
     if (pcb == NULL) return false;
 

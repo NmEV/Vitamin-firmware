@@ -141,6 +141,23 @@ bool storage_available(void) {
     return len > 0 && len <= STORAGE_MAX_PAYLOAD;
 }
 
+// Constant-time-ish comparison against the key pair in the record header:
+// the loop always runs over every byte of both keys, so a mismatch does not
+// reveal which byte differed.
+bool storage_keys_match(const uint8_t pk[STORAGE_KEY_LEN], const uint8_t sk[STORAGE_KEY_LEN]) {
+    if (!storage_available()) {
+        return false; // nothing valid stored: there is no key pair to match
+    }
+    const uint8_t *fpk = storage_flash + STORAGE_PK_OFF;
+    const uint8_t *fsk = storage_flash + STORAGE_SK_OFF;
+    uint8_t diff = 0;
+    for (size_t i = 0; i < STORAGE_KEY_LEN; ++i) {
+        diff |= (uint8_t)(pk[i] ^ fpk[i]);
+        diff |= (uint8_t)(sk[i] ^ fsk[i]);
+    }
+    return diff == 0;
+}
+
 size_t storage_read(uint8_t *dst, size_t cap) {
     if (!storage_available()) {
         return 0;
@@ -190,7 +207,8 @@ size_t storage_read(uint8_t *dst, size_t cap) {
     return len;
 }
 
-bool storage_write(const uint8_t *src, size_t len) {
+bool storage_write(const uint8_t *src, size_t len, uint8_t out_pk[STORAGE_KEY_LEN],
+                     uint8_t out_sk[STORAGE_KEY_LEN]) {
     if (len == 0 || len > STORAGE_MAX_PAYLOAD) {
         return false;
     }
@@ -245,7 +263,15 @@ bool storage_write(const uint8_t *src, size_t len) {
 
     uintptr_t params[2] = {STORAGE_TOTAL_BYTES, (uintptr_t)storage_buf};
     rc = flash_safe_execute(storage_program_cb, params, UINT32_MAX);
-    return rc == PICO_OK;
+    if (rc != PICO_OK) {
+        return false;
+    }
+
+    // Hand the writer its receipt: exactly the key pair that now seals the
+    // record on flash (POST /clear will demand these same keys back).
+    memcpy(out_pk, pk, STORAGE_KEY_LEN);
+    memcpy(out_sk, sk, STORAGE_KEY_LEN);
+    return true;
 }
 
 bool storage_clear(void) {

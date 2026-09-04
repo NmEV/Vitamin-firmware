@@ -3,9 +3,21 @@
 // Exposes three endpoints backed by the flash storage module:
 //   POST /write  body = JSON form, extracts the configured fields (default:
 //                {"name", "value"}), persists them (<= 2 KiB) to flash. 200 on
-//                success, 400 bad/invalid body, 413 payload too large.
+//                success, 400 bad/invalid body, 413 payload too large. The
+//                success response includes the fresh pk/sk (64 hex chars each)
+//                that sealed the record: keep them, they are the clear
+//                receipt for this record.
 //   GET  /print  returns the stored data (application/json). 200 always.
-//   GET  /clear  erases the stored data. 200 always.
+//   POST /clear  erases the stored data, but only when the JSON body carries
+//                the exact pk/sk returned by the /write of the current
+//                record: 403 on a mismatch (data untouched), 400 on a
+//                missing/malformed pair, 200 when nothing valid is stored
+//                (idempotent no-op). GET /clear -> 405: wiping must never be
+//                triggerable by a plain link/image request.
+//   GET  /sign   endpoint description.
+//   POST /sign   signs challenge:context:timestamp:device_id with the
+//                firmware's embedded Ed25519 key and returns the base64
+//                signature (legacy firmware endpoint, CORS-enabled).
 //
 // Nothing runs on its own thread: the server is driven by the caller's main
 // loop via the existing usb_network_update() (which services lwIP TCP).

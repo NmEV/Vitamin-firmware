@@ -16,9 +16,11 @@
    和 `ping demo.local` 都应该能通。
 3. **升级固件后无需手动清数据** —— 存储头部带格式版本号（见[存储与加密](#存储与加密)），
    固件与旧记录格式不兼容时旧数据会自动按空处理（`/print` 返回
-   `{"status":"empty"}`），下一次 `/write` 直接覆盖。只有想主动清空数据时才需要：
+   `{"status":"empty"}`），下一次 `/write` 直接覆盖。只有想主动清空数据时才需要——
+   `/clear` 只接受 POST，并且必须携带上一次 `/write` 返回的完全相同的密钥对：
    ```sh
-   curl http://192.168.7.1/clear
+   curl -X POST http://192.168.7.1/clear \
+        -d '{"pk":"<上一次 /write 返回的 pk>","sk":"<上一次 /write 返回的 sk>"}'
    ```
 
 ## Web 服务 API
@@ -28,20 +30,59 @@
 
 | 方法 | 路径 | 行为 |
 |------|------|------|
-| POST | `/write` | 发送 JSON 表单，如 `{"name":"alice","value":"hello"}`。提取配置字段（`web_server.c` 中的 `WRITE_FIELDS`，默认 `name`、`value`），**加密**后持久化到 flash。成功返回 `{"status":"ok","bytes":N}`；无效/空 body 返回 `400`；存储数据超过 2 KiB 返回 `413`。 |
+| POST | `/write` | 发送 JSON 表单，如 `{"name":"alice","value":"hello"}`。提取配置字段（`web_server.c` 中的 `WRITE_FIELDS`，默认 `name`、`value`），**加密**后持久化到 flash。成功返回 `{"status":"ok","bytes":N,"pk":"<64位hex>","sk":"<64位hex>"}`：`pk`/`sk` 是本次写入记录的**清除回执**，请妥善保存。无效/空 body 返回 `400`；存储数据超过 2 KiB 返回 `413`。 |
 | GET  | `/print` | 以 `application/json` 返回已存储的数据（读取时实时解密）；无有效数据时返回 `{"status":"empty"}`。 |
-| GET  | `/clear` | 擦除已存储的数据。返回 `{"status":"ok"}`。 |
-| 任意 | 其它路径 | `404`。 |
+| GET  | `/sign` | 端点描述：`{"endpoint":"/sign","method":"POST","fields":["challenge","context","timestamp"]}`。 |
+| POST | `/sign` | 用固件内置的 Ed25519 密钥对消息 `<challenge>:<context>:<timestamp>:device_001` 签名（自旧版固件迁移）。返回 `{"signature":"<base64>","timestamp":"<原样回显>","device_id":"device_001"}`；空 body/缺字段/格式错误返回 `400`。 |
+| POST | `/clear` | 擦除已存储的数据，但**只有 body 携带当前记录那次 `/write` 返回的完全相同的 `pk`/`sk`**（hex）时才会执行，如 `{"pk":"...","sk":"..."}`。完全一致 → `{"status":"ok"}`；不一致 → `403` 且数据保持不动；缺失/格式错误 → `400`；无有效记录 → `200`（幂等空操作）。 |
+| 任意 | 其它路径 | `404`。`GET /clear` 返回 `405`：擦除仅限 POST，浏览器链接或 `<img>` 永远无法触发擦除。 |
 
 示例：
 
 ```sh
 curl -X POST http://192.168.7.1/write -d '{"name":"alice","value":"hello"}'
-#   -> {"status":"ok","bytes":37}
+#   -> {"status":"ok","bytes":32,"pk":"<64 位 hex>","sk":"<64 位 hex>"}
 curl http://192.168.7.1/print
 #   -> {"name":"alice","value":"hello"}
-curl http://192.168.7.1/clear
+curl -X POST http://192.168.7.1/clear \
+     -d '{"pk":"<上一次 /write 返回的 pk>","sk":"<上一次 /write 返回的 sk>"}'
+#   -> {"status":"ok"}
 ```
+
+**清除回执**：每次 `/write` 都会生成全新的密钥对，成功响应会把它以 hex 形式
+（`pk`/`sk`）一并返回；设备端同样把这 64 字节存在记录头（偏移 36..99，见下文
+布局）。`POST /clear` 把提交的密钥对与记录头逐字节比对，完全一致才执行擦除：
+
+- 只有**最近一次 `/write`** 返回的回执有效：记录被再次写入后密钥轮换，旧回执
+  会得到 `403`。
+- 密钥不符时数据分毫不动；`GET /clear` 一律返回 `405`。
+- 回执丢失后，有效记录无法再通过 `/clear` 擦除，但 `/write` 可以直接覆盖
+  （写入不需要回执）。
+
+**签名端点（`/sign`）** —— 自旧版固件迁移而来：POST 一个包含
+`challenge`、`context`、`timestamp` 三个字段的 JSON 表单；固件用
+TweetNaCl `crypto_sign`（Ed25519）对 UTF-8 消息
+`<challenge>:<context>:<timestamp>:device_001` 签名，返回 base64 编码的
+64 字节原始签名、原样回显的时间戳和设备 ID：
+
+```sh
+curl -X POST http://192.168.7.1/sign \
+     -d '{"challenge":"abc","context":"login","timestamp":"2024-06-01T12:00:00Z"}'
+# -> {"signature":"<64 字节签名的 base64>","timestamp":"2024-06-01T12:00:00Z","device_id":"device_001"}
+```
+
+签名密钥固定在固件镜像中（与旧版固件使用相同常量，已有验签方无需改动）：
+设备 ID 为 `device_001`，Ed25519 公钥（base64）为
+`f/LmPWawjJ9QjK6GniT26UdCcgIEd2tcoy3lbvCThNQ=`。可用仓库自带的纯标准库验签
+工具（RFC 8032 实现，无第三方依赖）验证：
+
+```sh
+python sign_verify.py 'abc:login:2024-06-01T12:00:00Z:device_001' '<sign 返回的 signature>'
+# OK: signature is valid for this message and key
+```
+
+只有 `/sign` 的响应带 CORS 头并接受 OPTIONS 预检，方便主机上的网页调用；
+`/write`、`/print`、`/clear` 刻意不加 CORS，随机网页无法跨域读取回执或存储数据。
 
 **2 KiB 限制**针对的是*存储后的 JSON*（包含字段名、引号和花括号），而不是单纯的
 value。对固定 9 字符 `name` 的载荷，固定开销为 31 字节，因此可接受的 value 上限是
@@ -50,9 +91,9 @@ value。对固定 9 字符 `name` 的载荷，固定开销为 31 字节，因此
 
 **JSON 转义**：值中的常见转义（`\"`、`\\`、`\/`、`\b`、`\f`、`\n`、`\r`、`\t`）
 会被正确解码并在读取时重新转义，往返一致；不支持的转义（如 `\uXXXX`）或非法
-JSON 会返回 `400`，不会静默改写数据。**Content-Length**：值畸形（空、非数字、
-溢出）返回 `400`；声明长度超过接收缓冲（约 3.1 KB）会立即返回 `413` 并关闭连接，
-而不是挂起到超时。
+JSON 会返回 `400`，不会静默改写数据。**Content-Length**：空或非数字的值返回
+`400`；溢出的值会饱和并返回 `413`，声明长度超过接收缓冲（约 3.1 KB）也同样立即
+返回 `413` 并关闭连接，而不是挂起到超时。
 
 ## 存储与加密
 
@@ -87,6 +128,9 @@ JSON 会返回 `400`，不会静默改写数据。**Content-Length**：值畸形
 
 私钥与载荷一并存储（本功能的目标是*载荷*不以明文落盘，而非密钥保密），因此
 防护对象是"随手读 flash 转储"的人，而不是能同时拿到 flash 内容与固件的定向攻击者。
+记录头里这对密钥同时充当 `/clear` 的回执：只有提交的密钥对与头部逐字节一致时，
+`POST /clear` 才会擦除——这能挡住误触链接、网页 `<img>` 之类的意外请求；但正如
+上文所述，能直接 dump flash 的人同样拿得到密钥，因此它不对抗这类攻击者。
 
 ## 内存配置（`pico_config.h`）
 
@@ -108,14 +152,20 @@ JSON 会返回 `400`，不会静默改写数据。**Content-Length**：值畸形
 python stress_test.py                    # 100 轮：write -> print -> 校验
 python stress_test.py -n 500 -s 512      # 500 轮，value 512 字节
 python stress_test.py -w 4 --mode write  # 4 并发 worker，纯写吞吐
+python stress_test.py --mode clear       # 用最近一次 /write 的回执擦除数据
 python stress_test.py --help             # 查看全部选项
 ```
 
-预检会校验契约（`/clear` 后 `/print` 返回 `{"status":"empty"}`；超限 `/write`
-被 `413` 拒绝且响应必须是完整可解析的 JSON——防止响应体长度类回归；单 worker
-下还会做一次 JSON 转义往返校验），并二分探测真实可接受的最大 value 长度（预期
-约 `2017`）。`-s` 超过上限会在启动时直接拒绝，避免注定失败配置刷出成片
-`413`。注意：对写入数据的逐字节校验只在 `--workers 1` 下有意义。
+预检会校验带密钥保护的清除契约（`GET /clear` 必须返回 `405`；探测 `/write`
+必须返回 `pk`/`sk` 回执；错误密钥的 `/clear` 必须 `403` 且数据原封不动；
+正确回执能擦除记录，随后对空槽重复 `/clear` 仍是 `200` 空操作），超限
+`/write` 被 `413` 干净拒绝，每个错误响应都必须是完整可解析的 JSON（防止响应体
+长度类回归），单 worker 下做 JSON 转义往返校验，并二分探测真实最大 value 长度
+（预期约 `2017`）。工具会自动记住每次成功 `/write` 的回执，因此
+`--mode clear` 能擦除本次运行写入的数据；要清除早期会话写入的记录请传
+`--pk`/`--sk`（预检无法清除的旧记录会被探测写入覆盖）。`-s` 超过上限会在
+启动时直接拒绝，避免注定失败配置刷出成片 `413`。注意：对写入数据的逐字节校验
+只在 `--workers 1` 下有意义。
 
 ## 构建
 

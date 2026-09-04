@@ -3,9 +3,13 @@
 """Simple stress test tool for the usbnet web service.
 
 Targets the Pico's web server (default 192.168.7.1:80), which exposes:
-    POST /write   persist a JSON form (fields: name, value) to flash (<= 2 KiB)
+    POST /write   persist a JSON form (fields: name, value) to flash (<= 2 KiB);
+                  the success response returns the pk/sk (hex) receipt that
+                  sealed the record
     GET  /print   return the stored data
-    GET  /clear   erase the stored data
+    POST /clear   erase the stored data, but only with the exact pk/sk receipt
+                  returned by the /write of the current record (wrong keys ->
+                  403, data untouched; empty record -> 200 no-op; GET -> 405)
 
 Modes:
     cycle (default)  one full cycle per iteration: POST /write with random
@@ -13,7 +17,12 @@ Modes:
                      the payload that was written.
     write            POST /write only (raw write throughput).
     print            GET /print only.
-    clear            GET /clear only.
+    clear            POST /clear with the receipt: the keys returned by the
+                     last /write of this run, or --pk/--sk for a receipt from
+                     an earlier session.
+
+The tool always remembers the pk/sk receipt of its last successful /write, so
+a plain "python stress_test.py --mode clear" wipes whatever this run wrote.
 
 Verification of the returned data is only meaningful with a single worker
 (--workers 1); with more workers the shared storage is contended and
@@ -85,6 +94,37 @@ def valid_json(body):
         return False
 
 
+# pk/sk receipt returned by the last successful /write. POST /clear only
+# erases a valid record when the body carries exactly this pair (the device
+# compares it against the keys stored in the record header); wrong or missing
+# keys are refused with 403/400 and the data stays intact.
+LAST_PK = None
+LAST_SK = None
+LAST_LOCK = threading.Lock()
+
+
+def parse_write_receipt(body):
+    """Remember the pk/sk receipt from a /write response, if present."""
+    global LAST_PK, LAST_SK
+    try:
+        doc = json.loads(body.decode("utf-8"))
+        pk, sk = doc.get("pk"), doc.get("sk")
+        if isinstance(pk, str) and isinstance(sk, str) and len(pk) == 64 and len(sk) == 64:
+            with LAST_LOCK:
+                LAST_PK, LAST_SK = pk, sk
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def clear_body(pk=None, sk=None):
+    """JSON body for POST /clear, or None when no receipt is available."""
+    if pk and sk:
+        return json.dumps({"pk": pk, "sk": sk}, separators=(",", ":"))
+    return None
+
+
 def check_escape_roundtrip(base, timeout):
     """/write then /print must round-trip JSON-escaped values byte for byte.
 
@@ -103,6 +143,7 @@ def check_escape_roundtrip(base, timeout):
     status, body = http_call(base, "POST", "/write", payload, timeout)
     if status != 200:
         return False, f"escape write -> {status} {body!r}"
+    parse_write_receipt(body)
     status, body = http_call(base, "GET", "/print", None, timeout)
     if status != 200:
         return False, f"escape read -> {status} {body!r}"
@@ -130,7 +171,9 @@ def find_max_value_len(base, timeout=10):
     """
     def works(v):
         try:
-            status, _ = http_call(base, "POST", "/write", make_payload(v), timeout)
+            status, body = http_call(base, "POST", "/write", make_payload(v), timeout)
+            if status == 200:
+                parse_write_receipt(body)  # keep the receipt of the latest write
             return status == 200
         except Exception:
             return False
@@ -187,6 +230,8 @@ def run_cycle(args, base, tally, contended):
         return
     ms = (time.perf_counter() - t0) * 1000.0
     ok = status == 200 and b'"status":"ok"' in body
+    if ok:
+        parse_write_receipt(body)
     tally.add("write", ms, ok=ok, error=None if ok else f"write={status}")
 
     t0 = time.perf_counter()
@@ -213,8 +258,11 @@ def run_single(args, base, tally, op):
         path, method, req_body = "/write", "POST", body
     elif op == "print":
         path, method, req_body = "/print", "GET", None
-    else:
-        path, method, req_body = "/clear", "GET", None
+    else:  # clear: destructive, so it is POST-only and needs the receipt
+        path, method = "/clear", "POST"
+        with LAST_LOCK:
+            pk, sk = args.pk or LAST_PK, args.sk or LAST_SK
+        req_body = clear_body(pk, sk)
 
     t0 = time.perf_counter()
     try:
@@ -224,28 +272,76 @@ def run_single(args, base, tally, op):
         return
     ms = (time.perf_counter() - t0) * 1000.0
     ok = status == 200
+    if ok and op == "write":
+        parse_write_receipt(resp)
     tally.add(op, ms, ok=ok, error=None if ok else f"{op}={status}")
 
 
 def preflight_checks(base, args, tally):
-    """Verify the server is reachable and the basic contract holds.
+    """Verify the server is reachable and the key-protected /clear contract.
 
-    Runs: /clear -> /print expecting {"status":"empty"}, checks that a 404
-    comes back as one clean JSON document, verifies JSON-escape round-trips
-    (single worker), probes the largest accepted value length, then checks
-    that /write rejects a value beyond it with a clean 413. Returns
-    (ok, max_value_len).
+    Runs: checks that GET /clear is refused (405), writes a probe record and
+    checks that /clear with wrong keys is refused (403) while the data stays
+    intact, that /clear with the exact receipt wipes the record, that a second
+    /clear on the now-empty slot is an idempotent no-op, that a 404 comes back
+    as one clean JSON document, verifies JSON-escape round-trips (single
+    worker), probes the largest accepted value length, then checks that /write
+    rejects a value beyond it with a clean 413. Any record present at startup
+    (whose receipt this run does not know) is overwritten by the probe write.
+    Returns (ok, max_value_len).
     """
     ok_all = True
 
+    # A stray GET must never wipe the record: it is answered 405.
     status, _ = http_call(base, "GET", "/clear", None, args.timeout)
-    ok_all &= status == 200
-
-    status, body = http_call(base, "GET", "/print", None, args.timeout)
-    empty = status == 200 and b'"status":"empty"' in body
-    if not empty:
+    if status != 405:
         ok_all = False
-        print(f"[Preflight] FAIL: /print after /clear -> {status} {body!r}")
+        print(f"[Preflight] FAIL: GET /clear -> {status} (expected 405)")
+
+    # A record from an earlier session cannot be cleared (its receipt was not
+    # kept); the probe write below overwrites it instead.
+    status, body = http_call(base, "GET", "/print", None, args.timeout)
+    if status == 200 and body != b'{"status":"empty"}':
+        print("[Preflight]  note: existing record overwritten by the probe write")
+
+    # Probe write: the response must carry the pk/sk receipt.
+    probe = make_payload(16)
+    status, body = http_call(base, "POST", "/write", probe, args.timeout)
+    if status != 200 or not parse_write_receipt(body):
+        ok_all = False
+        print(f"[Preflight] FAIL: /write without key-pair receipt -> {status} {body!r}")
+    else:
+        # Wrong keys: 403, and the record must be untouched afterwards.
+        status, body = http_call(base, "POST", "/clear",
+                                 clear_body("0" * 64, "1" * 64), args.timeout)
+        if status != 403:
+            ok_all = False
+            print(f"[Preflight] FAIL: /clear with wrong keys -> {status} (expected 403) {body!r}")
+        status, body = http_call(base, "GET", "/print", None, args.timeout)
+        if status != 200 or body.decode("utf-8", "replace") != probe:
+            ok_all = False
+            print(f"[Preflight] FAIL: rejected /clear altered the data -> {status} {body!r}")
+
+        # The exact receipt wipes the record...
+        with LAST_LOCK:
+            cur_pk, cur_sk = LAST_PK, LAST_SK
+        status, body = http_call(base, "POST", "/clear",
+                                 clear_body(cur_pk, cur_sk), args.timeout)
+        if status != 200:
+            ok_all = False
+            print(f"[Preflight] FAIL: /clear with the receipt -> {status} (expected 200) {body!r}")
+        status, body = http_call(base, "GET", "/print", None, args.timeout)
+        empty = status == 200 and b'"status":"empty"' in body
+        if not empty:
+            ok_all = False
+            print(f"[Preflight] FAIL: /print after authorized /clear -> {status} {body!r}")
+
+        # ...and a second clear on the now-empty slot is an idempotent no-op.
+        status, body = http_call(base, "POST", "/clear",
+                                 clear_body(cur_pk, cur_sk), args.timeout)
+        if status != 200:
+            ok_all = False
+            print(f"[Preflight] FAIL: repeated /clear on empty slot -> {status} (expected 200) {body!r}")
 
     # A 404 must come back as one clean, parseable JSON document.
     status, body = http_call(base, "GET", "/definitely-not-a-route", None, args.timeout)
@@ -330,10 +426,18 @@ def main():
                          "maximum is 2017 chars, probed exactly at preflight)")
     ap.add_argument("--mode", choices=["cycle", "write", "print", "clear"], default="cycle")
     ap.add_argument("--timeout", type=float, default=10.0, help="per-request timeout (seconds)")
+    ap.add_argument("--pk", default=None,
+                    help="public-key half of a /write receipt (64 hex chars); "
+                         "POST /clear needs it to erase a valid record")
+    ap.add_argument("--sk", default=None,
+                    help="secret-key half of a /write receipt (64 hex chars); "
+                         "POST /clear needs it to erase a valid record")
     ap.add_argument("--no-preflight", action="store_true",
-                    help="skip clear/empty checks (the write limit is still enforced)")
+                    help="skip the /clear-contract checks (the write limit is still enforced)")
     ap.add_argument("-v", "--verbose", action="store_true", help="print every result")
     args = ap.parse_args()
+    if bool(args.pk) != bool(args.sk):
+        ap.error("--pk and --sk must be given together (the /write receipt)")
 
     # Hard analytic cap for this tool's payload: the server's 2 KiB limit
     # applies to the STORED JSON, which is 31 bytes of overhead (field names,
