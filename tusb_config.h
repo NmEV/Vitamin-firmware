@@ -116,6 +116,18 @@ extern "C" {
 #define CFG_TUD_ECM_RNDIS USE_ECM
 #define CFG_TUD_NCM (1 - CFG_TUD_ECM_RNDIS)
 
+//--------------------------------------------------------------------
+// Project feature switch (read by the web server and other app code)
+//--------------------------------------------------------------------
+
+// When 1 the HTTP GET /print endpoint (read-back of the stored record) is
+// compiled into the web server; when 0 (the default) the endpoint is absent
+// and GET /print is answered 404 like any unknown path. Debug builds can
+// override this with -DDEBUG=1 on the command line.
+#ifndef DEBUG
+#define DEBUG 0
+#endif
+
 #ifdef __cplusplus
 }
 #endif

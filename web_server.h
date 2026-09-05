@@ -7,7 +7,9 @@
 //                success response includes the fresh pk/sk (64 hex chars each)
 //                that sealed the record: keep them, they are the clear
 //                receipt for this record.
-//   GET  /print  returns the stored data (application/json). 200 always.
+//   GET  /print  returns the stored data (application/json). Only compiled in
+//                when DEBUG=1 in tusb_config.h (default 0): in release builds
+//                this path is answered 404 like any unknown route.
 //   POST /clear  erases the stored data, but only when the JSON body carries
 //                the exact pk/sk returned by the /write of the current
 //                record: 403 on a mismatch (data untouched), 400 on a

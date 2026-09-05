@@ -292,6 +292,15 @@ def preflight_checks(base, args, tally):
     """
     ok_all = True
 
+    # GET /print only exists in firmware built with DEBUG=1 (tusb_config.h).
+    # Detect a DEBUG=0 build up front, so the rest of the checks do not turn
+    # into a wall of confusing 404 failures.
+    status, _ = http_call(base, "GET", "/print", None, args.timeout)
+    if status == 404:
+        print("[Preflight] FAIL: firmware has no /print endpoint (tusb_config.h "
+              "DEBUG=0); set DEBUG=1 and reflash to run this tool")
+        return False, None
+
     # A stray GET must never wipe the record: it is answered 405.
     status, _ = http_call(base, "GET", "/clear", None, args.timeout)
     if status != 405:

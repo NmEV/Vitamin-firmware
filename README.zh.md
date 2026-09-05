@@ -31,7 +31,7 @@
 | 方法 | 路径 | 行为 |
 |------|------|------|
 | POST | `/write` | 发送 JSON 表单，如 `{"name":"alice","value":"hello"}`。提取配置字段（`web_server.c` 中的 `WRITE_FIELDS`，默认 `name`、`value`），**加密**后持久化到 flash。成功返回 `{"status":"ok","bytes":N,"pk":"<64位hex>","sk":"<64位hex>"}`：`pk`/`sk` 是本次写入记录的**清除回执**，请妥善保存。无效/空 body 返回 `400`；存储数据超过 2 KiB 返回 `413`。 |
-| GET  | `/print` | 以 `application/json` 返回已存储的数据（读取时实时解密）；无有效数据时返回 `{"status":"empty"}`。 |
+| GET  | `/print` | 以 `application/json` 返回已存储的数据（读取时实时解密）；无有效数据时返回 `{"status":"empty"}`。该端点仅在 `DEBUG=1`（`tusb_config.h`）时编译进固件，默认固件下返回 `404`。 |
 | GET  | `/sign` | 端点描述：`{"endpoint":"/sign","method":"POST","fields":["challenge","context","timestamp"]}`。 |
 | POST | `/sign` | 用固件内置的 Ed25519 密钥对消息 `<challenge>:<context>:<timestamp>:device_001` 签名（自旧版固件迁移）。返回 `{"signature":"<base64>","timestamp":"<原样回显>","device_id":"device_001"}`；空 body/缺字段/格式错误返回 `400`。 |
 | POST | `/clear` | 擦除已存储的数据，但**只有 body 携带当前记录那次 `/write` 返回的完全相同的 `pk`/`sk`**（hex）时才会执行，如 `{"pk":"...","sk":"..."}`。完全一致 → `{"status":"ok"}`；不一致 → `403` 且数据保持不动；缺失/格式错误 → `400`；无有效记录 → `200`（幂等空操作）。 |
@@ -165,7 +165,9 @@ python stress_test.py --help             # 查看全部选项
 `--mode clear` 能擦除本次运行写入的数据；要清除早期会话写入的记录请传
 `--pk`/`--sk`（预检无法清除的旧记录会被探测写入覆盖）。`-s` 超过上限会在
 启动时直接拒绝，避免注定失败配置刷出成片 `413`。注意：对写入数据的逐字节校验
-只在 `--workers 1` 下有意义。
+只在 `--workers 1` 下有意义。工具通过 `GET /print` 校验写入，而该端点只在
+`DEBUG=1`（`tusb_config.h`）的固件中存在；默认 `DEBUG=0` 固件下预检会以明确
+提示中止。
 
 ## 构建
 
@@ -193,6 +195,9 @@ make -j$(nproc)
 
 - 协议切换：`tusb_config.h` 的 `USE_ECM`（0 = CDC-NCM，适合 iOS / Windows 11；
   1 = ECM + RNDIS，适合 Windows / macOS）。
+- 调试读回：`tusb_config.h` 中的 `DEBUG`（默认 0）。HTTP `GET /print`
+  端点（读回已存储记录）仅在 `DEBUG=1` 时编译进固件；`DEBUG=0` 时该路径返回
+  `404`。需要读回数据时请以 `DEBUG=1` 构建固件。
 - 字段配置：`web_server.c` 中的 `WRITE_FIELDS`（默认为 `name`、`value`）。
 - `flash_program.c` 是官方 flash 读写示例，仅作参考，**不参与编译**（它自带
   `main`）。

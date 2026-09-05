@@ -39,7 +39,7 @@ contain a `Content-Length` header.
 | Method | Path    | Behavior |
 |--------|---------|----------|
 | POST   | `/write` | Sends a JSON form, e.g. `{"name":"alice","value":"hello"}`. The configured fields (`WRITE_FIELDS` in `web_server.c`, default `name` and `value`) are extracted and **encrypted**, then persisted to flash. Returns `{"status":"ok","bytes":N,"pk":"<64 hex>","sk":"<64 hex>"}`: `pk`/`sk` are the **clear receipt** of the record just written — keep them. `400` on an invalid/empty body, `413` if the stored data exceeds 2 KiB. |
-| GET    | `/print` | Returns the stored data as `application/json` (decrypted on the fly), or `{"status":"empty"}` if nothing valid is stored. |
+| GET    | `/print` | Returns the stored data as `application/json` (decrypted on the fly), or `{"status":"empty"}` if nothing valid is stored. Only compiled in when `DEBUG=1` (`tusb_config.h`); default builds answer `404`. |
 | GET    | `/sign` | Endpoint description: `{"endpoint":"/sign","method":"POST","fields":["challenge","context","timestamp"]}`. |
 | POST   | `/sign` | Ed25519-signs the message `<challenge>:<context>:<timestamp>:device_001` with the firmware's embedded key (migrated from the legacy firmware). Returns `{"signature":"<base64>","timestamp":"<echoed>","device_id":"device_001"}`. `400` on an empty/missing/malformed field. |
 | POST   | `/clear` | Erases the stored data, but **only when the body carries the exact `pk`/`sk`** (hex) that the `/write` of the current record returned, e.g. `{"pk":"...","sk":"..."}`. Exact match → `{"status":"ok"}`; mismatch → `403` and the data stays untouched; missing/malformed pair → `400`; nothing valid stored → `200` (idempotent no-op). |
@@ -199,7 +199,10 @@ successful `/write`, so `--mode clear` wipes what this run wrote; pass
 record the preflight cannot clear is overwritten by its probe write). `-s`
 above the limit is refused at startup, so a doomed configuration cannot
 produce a stream of `413`s. Note: byte-for-byte verification of written data
-is only meaningful with `--workers 1`.
+is only meaningful with `--workers 1`. The tool verifies writes through
+`GET /print`, which only exists in `DEBUG=1` builds (`tusb_config.h`);
+against a default (`DEBUG=0`) firmware its preflight aborts with a clear
+message.
 
 ## Building
 
@@ -229,6 +232,10 @@ the CI overrides it to `pico2`.
 
 - Protocol: `USE_ECM` in `tusb_config.h` (0 = CDC-NCM for iOS/Windows 11,
   1 = ECM + RNDIS for Windows/macOS).
+- Debug read-back: `DEBUG` in `tusb_config.h` (default 0). The HTTP
+  `GET /print` endpoint (read-back of the stored record) is only compiled in
+  when `DEBUG=1`; with `DEBUG=0` the path answers `404`. Build a
+  `DEBUG=1` image when you need to read the stored data back.
 - Fields: `WRITE_FIELDS` in `web_server.c` (defaults to `name`, `value`).
 - `flash_program.c` is the upstream reference for the flash write/read
   pattern and is **not part of the build** (it has its own `main`).

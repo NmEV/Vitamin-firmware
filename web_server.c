@@ -7,7 +7,8 @@
 //   POST /write  -> persist JSON form fields to flash (<= 2 KiB). The success
 //                   response carries the fresh pk/sk (hex) that sealed the
 //                   record: that pair is the writer's clear-receipt.
-//   GET  /print  -> return the stored data
+//   GET  /print  -> return the stored data (only compiled in when DEBUG=1 in
+//                   tusb_config.h; otherwise this path answers 404)
 //   POST /clear  -> erase the stored data, but only when the JSON body's pk/sk
 //                   exactly match the current record's key pair (403 on a
 //                   mismatch; 400 on a missing/malformed pair). A record-less
@@ -30,6 +31,15 @@
 #include "lwip/ip.h"
 #include "lwip/ip_addr.h"
 #include "lwip/tcp.h"
+
+// tusb_config.h normally compiles only inside TinyUSB translation units, where
+// the build provides CFG_TUSB_MCU. This TU only needs the project's DEBUG
+// switch from that header, so satisfy its guard with a placeholder value:
+// tusb_config.h itself never uses CFG_TUSB_MCU.
+#ifndef CFG_TUSB_MCU
+#define CFG_TUSB_MCU 0
+#endif
+#include "tusb_config.h"
 
 #include "storage.h"
 #include "tweetnacl.h"
@@ -526,6 +536,7 @@ static void handle_write(http_conn_t *c, struct tcp_pcb *pcb) {
 }
 
 static void handle_print(http_conn_t *c, struct tcp_pcb *pcb) {
+#if DEBUG
     static uint8_t data[STORAGE_MAX_PAYLOAD];
     size_t n = storage_read(data, sizeof(data));
     if (n > 0) {
@@ -533,6 +544,11 @@ static void handle_print(http_conn_t *c, struct tcp_pcb *pcb) {
     } else {
         respond_err(c, pcb, "200 OK", "{\"status\":\"empty\"}");
     }
+#else
+    // /print is a debug read-back endpoint: unless the firmware was built with
+    // DEBUG=1 (see tusb_config.h) it behaves exactly like any unknown path.
+    respond_err(c, pcb, "404 Not Found", "{\"status\":\"error\",\"error\":\"not found\"}");
+#endif
 }
 
 static void handle_sign_info(http_conn_t *c, struct tcp_pcb *pcb) {
