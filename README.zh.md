@@ -34,7 +34,7 @@
 | GET  | `/print` | 以 `application/json` 返回已存储的数据（读取时实时解密）；无有效数据时返回 `{"status":"empty"}`。该端点仅在 `DEBUG=1`（`tusb_config.h`）时编译进固件，默认固件下返回 `404`。 |
 | GET  | `/sign` | 端点描述：`{"endpoint":"/sign","method":"POST","fields":["challenge","context","timestamp"]}`。 |
 | POST | `/sign` | 用固件内置的 Ed25519 密钥对消息 `<challenge>:<context>:<timestamp>:device_001` 签名（自旧版固件迁移）。返回 `{"signature":"<base64>","timestamp":"<原样回显>","device_id":"device_001"}`；空 body/缺字段/格式错误返回 `400`。 |
-| POST | `/clear` | 擦除已存储的数据，但**只有 body 携带当前记录那次 `/write` 返回的完全相同的 `pk`/`sk`**（hex）时才会执行，如 `{"pk":"...","sk":"..."}`。完全一致 → `{"status":"ok"}`；不一致 → `403` 且数据保持不动；缺失/格式错误 → `400`；无有效记录 → `200`（幂等空操作）。 |
+| POST | `/clear` | 擦除已存储的数据，但**只有 body 携带当前记录那次 `/write` 返回的完全相同的 `pk`/`sk`**（hex）时才会执行，如 `{"pk":"...","sk":"..."}`。完全一致 → `{"status":"ok"}`；不一致 → `403` 且数据保持不动；缺失/格式错误 → `400`；无有效记录 → `200`（幂等空操作）。该端点同样带宽松 CORS 头（`Access-Control-Allow-Origin: *`）并支持 OPTIONS 预检（须携带正确回执才会真正擦除）。 |
 | 任意 | 其它路径 | `404`。`GET /clear` 返回 `405`：擦除仅限 POST，浏览器链接或 `<img>` 永远无法触发擦除。 |
 
 示例：
@@ -81,9 +81,11 @@ python sign_verify.py 'abc:login:2024-06-01T12:00:00Z:device_001' '<sign 返回�
 # OK: signature is valid for this message and key
 ```
 
-`/write` 与 `/sign` 的响应带宽松 CORS 头（`Access-Control-Allow-Origin: *`）并接受
-OPTIONS 预检，主机上的网页可以跨域调用并读取响应；`/print`、`/clear` 刻意不加
-CORS，随机网页无法跨域读取存储数据，也无法预检触发擦除。
+`/write`、`/clear`、`/sign` 的响应带宽松 CORS 头（`Access-Control-Allow-Origin: *`）
+并接受 OPTIONS 预检，主机上的网页可以跨域写入、清除与签名；`/print` 刻意不加
+CORS，随机网页无法跨域读取存储数据。清除有效记录仍必须携带其完全一致的
+`pk`/`sk` 回执（否则 `403`），空槽上的 `/clear` 也只是无害的 `200` 空操作——
+放开 CORS 无法抹掉网页本不知晓其回执的数据。
 
 **2 KiB 限制**针对的是*存储后的 JSON*（包含字段名、引号和花括号），而不是单纯的
 value。对固定 9 字符 `name` 的载荷，固定开销为 31 字节，因此可接受的 value 上限是

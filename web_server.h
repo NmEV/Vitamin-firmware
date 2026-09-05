@@ -8,7 +8,7 @@
 //                that sealed the record: keep them, they are the clear
 //                receipt for this record. CORS-enabled (Access-Control-Allow-*)
 //                with OPTIONS preflight, so browser apps on the host can POST
-//                and read the response; /print and /clear stay CORS-free.
+//                and read the response; /print stays CORS-free.
 //   GET  /print  returns the stored data (application/json). Only compiled in
 //                when DEBUG=1 in tusb_config.h (default 0): in release builds
 //                this path is answered 404 like any unknown route.
@@ -17,7 +17,8 @@
 //                record: 403 on a mismatch (data untouched), 400 on a
 //                missing/malformed pair, 200 when nothing valid is stored
 //                (idempotent no-op). GET /clear -> 405: wiping must never be
-//                triggerable by a plain link/image request.
+//                triggerable by a plain link/image request. CORS-enabled
+//                (Access-Control-Allow-* with OPTIONS preflight) like /write.
 //   GET  /sign   endpoint description.
 //   POST /sign   signs challenge:context:timestamp:device_id with the
 //                firmware's embedded Ed25519 key and returns the base64

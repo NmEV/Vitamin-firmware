@@ -42,7 +42,7 @@ contain a `Content-Length` header.
 | GET    | `/print` | Returns the stored data as `application/json` (decrypted on the fly), or `{"status":"empty"}` if nothing valid is stored. Only compiled in when `DEBUG=1` (`tusb_config.h`); default builds answer `404`. |
 | GET    | `/sign` | Endpoint description: `{"endpoint":"/sign","method":"POST","fields":["challenge","context","timestamp"]}`. |
 | POST   | `/sign` | Ed25519-signs the message `<challenge>:<context>:<timestamp>:device_001` with the firmware's embedded key (migrated from the legacy firmware). Returns `{"signature":"<base64>","timestamp":"<echoed>","device_id":"device_001"}`. `400` on an empty/missing/malformed field. |
-| POST   | `/clear` | Erases the stored data, but **only when the body carries the exact `pk`/`sk`** (hex) that the `/write` of the current record returned, e.g. `{"pk":"...","sk":"..."}`. Exact match → `{"status":"ok"}`; mismatch → `403` and the data stays untouched; missing/malformed pair → `400`; nothing valid stored → `200` (idempotent no-op). |
+| POST   | `/clear` | Erases the stored data, but **only when the body carries the exact `pk`/`sk`** (hex) that the `/write` of the current record returned, e.g. `{"pk":"...","sk":"..."}`. Exact match → `{"status":"ok"}`; mismatch → `403` and the data stays untouched; missing/malformed pair → `400`; nothing valid stored → `200` (idempotent no-op). CORS-enabled (`Access-Control-Allow-Origin: *`, OPTIONS preflight) like `/write`. |
 | any    | other    | `404`. `GET /clear` is answered `405`: wiping is POST-only so a browser link or an `<img>` can never erase the record. |
 
 Example:
@@ -93,11 +93,13 @@ python sign_verify.py 'abc:login:2024-06-01T12:00:00Z:device_001' '<signature fr
 # OK: signature is valid for this message and key
 ```
 
-`/write` and `/sign` answer with permissive CORS headers
-(`Access-Control-Allow-Origin: *`) and accept the OPTIONS preflight, so a
-browser page on the host can call them and read the responses; `/print` and
-`/clear` deliberately stay CORS-free so a random web page cannot read the
-stored data and cannot preflight a wipe.
+`/write`, `/clear` and `/sign` answer with permissive CORS headers
+(`Access-Control-Allow-Origin: *`) and accept the OPTIONS preflight, so
+browser apps on the host can write, clear and sign from a page; `/print`
+deliberately stays CORS-free, so a random web page cannot read the stored
+data. Clearing a valid record still requires its exact `pk`/`sk` receipt
+(`403` otherwise) and an empty slot turns `/clear` into a harmless `200`
+no-op, so enabling CORS cannot wipe anything a page does not already know.
 
 **The 2 KiB limit** applies to the *stored* JSON (field names, quotes and
 braces included), not just the value. With the tool's 9-character `name`, the

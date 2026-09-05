@@ -371,10 +371,11 @@ static void release_conn(http_conn_t *c) {
 // response / routing
 // ---------------------------------------------------------------------------
 
-// cors=true additionally sends the Access-Control-Allow-* headers. /write and
-// /sign answer with them so browser apps on the host can POST and read the
-// responses cross-origin; /print and /clear deliberately stay CORS-free so a
-// random web page cannot read the stored data nor preflight a wipe.
+// cors=true additionally sends the Access-Control-Allow-* headers. /write,
+// /clear and /sign answer with them so browser apps on the host can POST and
+// read the responses cross-origin; /print stays CORS-free so a random web
+// page cannot read the stored data (wiping via /clear still requires the
+// current record's key pair).
 static void respond_ex(http_conn_t *c, struct tcp_pcb *pcb, const char *status, const char *body, size_t body_len,
                        bool cors) {
     char head[320];
@@ -629,7 +630,7 @@ static void handle_clear(http_conn_t *c, struct tcp_pcb *pcb) {
     // already treated as empty): nothing is protected here, so wiping is an
     // idempotent no-op that needs no key pair.
     if (!storage_available()) {
-        respond_err(c, pcb, "200 OK", storage_clear() ? "{\"status\":\"ok\"}" : "{\"status\":\"error\"}");
+        respond_err_cors(c, pcb, "200 OK", storage_clear() ? "{\"status\":\"ok\"}" : "{\"status\":\"error\"}");
         return;
     }
 
@@ -638,7 +639,7 @@ static void handle_clear(http_conn_t *c, struct tcp_pcb *pcb) {
     const char *json = (const char *)c->buf + c->body_start;
     size_t jlen = c->content_length;
     if (jlen == 0) {
-        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"missing key pair\"}");
+        respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"missing key pair\"}");
         return;
     }
 
@@ -646,33 +647,33 @@ static void handle_clear(http_conn_t *c, struct tcp_pcb *pcb) {
     json_field_result_t rp = json_get_string(json, jlen, "pk", pk_s, sizeof(pk_s));
     json_field_result_t rs = json_get_string(json, jlen, "sk", sk_s, sizeof(sk_s));
     if (rp == JSON_FIELD_INVALID || rs == JSON_FIELD_INVALID) {
-        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"malformed json body\"}");
+        respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"malformed json body\"}");
         return;
     }
     if (rp != JSON_FIELD_FOUND || rs != JSON_FIELD_FOUND) {
-        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"missing key pair\"}");
+        respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"missing key pair\"}");
         return;
     }
     if (strlen(pk_s) != 2 * 32 || strlen(sk_s) != 2 * 32) {
-        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"bad key encoding\"}");
+        respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"bad key encoding\"}");
         return;
     }
 
     uint8_t pk[32], sk[32];
     if (!hex_to_bytes(pk_s, 2 * 32, pk, sizeof(pk)) || !hex_to_bytes(sk_s, 2 * 32, sk, sizeof(sk))) {
-        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"bad key encoding\"}");
+        respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"bad key encoding\"}");
         return;
     }
     if (!storage_keys_match(pk, sk)) {
         // Data is left untouched: only the receipt holder may wipe the record.
-        respond_err(c, pcb, "403 Forbidden", "{\"status\":\"error\",\"error\":\"key pair mismatch\"}");
+        respond_err_cors(c, pcb, "403 Forbidden", "{\"status\":\"error\",\"error\":\"key pair mismatch\"}");
         return;
     }
     if (!storage_clear()) {
-        respond_err(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"flash erase failed\"}");
+        respond_err_cors(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"flash erase failed\"}");
         return;
     }
-    respond_err(c, pcb, "200 OK", "{\"status\":\"ok\"}");
+    respond_err_cors(c, pcb, "200 OK", "{\"status\":\"ok\"}");
 }
 
 static void handle_request(http_conn_t *c, struct tcp_pcb *pcb) {
@@ -684,9 +685,9 @@ static void handle_request(http_conn_t *c, struct tcp_pcb *pcb) {
     } else if (strcmp(c->method, "GET") == 0 && strcmp(c->path, "/print") == 0) {
         handle_print(c, pcb);
     } else if (strcmp(c->path, "/sign") == 0) {
-        // Ed25519 signing endpoint (see the section above). Like /write, this
-        // path answers with Access-Control-Allow-* headers and accepts the
-        // OPTIONS preflight; /print and /clear intentionally stay CORS-free.
+        // Ed25519 signing endpoint (see the section above). Like /write and
+        // /clear, this path answers with Access-Control-Allow-* headers and
+        // accepts the OPTIONS preflight; /print stays CORS-free.
         if (strcmp(c->method, "POST") == 0) {
             handle_sign(c, pcb);
         } else if (strcmp(c->method, "GET") == 0) {
@@ -698,11 +699,15 @@ static void handle_request(http_conn_t *c, struct tcp_pcb *pcb) {
                              "{\"status\":\"error\",\"error\":\"POST /sign with challenge, context and timestamp\"}");
         }
     } else if (strcmp(c->path, "/clear") == 0) {
-        // /clear wipes stored data, so it is key-protected and POST-only: a
-        // plain GET (e.g. a browser <img> or an accidental link) must never
-        // be able to erase the record.
+        // /clear wipes stored data, so it is POST-only and key-protected: a
+        // plain GET (e.g. a browser <img> or an accidental link) can never
+        // erase the record - only a POST carrying the exact pk/sk receipt of
+        // the current record can. CORS-enabled (OPTIONS preflight below) so
+        // browser apps on the host can clear what they wrote.
         if (strcmp(c->method, "POST") == 0) {
             handle_clear(c, pcb);
+        } else if (strcmp(c->method, "OPTIONS") == 0) {
+            respond_cors(c, pcb, "200 OK", "", 0);
         } else {
             respond_err(c, pcb, "405 Method Not Allowed", "{\"status\":\"error\",\"error\":\"POST /clear with the key pair from the last /write\"}");
         }
