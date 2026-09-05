@@ -30,7 +30,7 @@
 
 | 方法 | 路径 | 行为 |
 |------|------|------|
-| POST | `/write` | 发送 JSON 表单，如 `{"name":"alice","value":"hello"}`。提取配置字段（`web_server.c` 中的 `WRITE_FIELDS`，默认 `name`、`value`），**加密**后持久化到 flash。成功返回 `{"status":"ok","bytes":N,"pk":"<64位hex>","sk":"<64位hex>"}`：`pk`/`sk` 是本次写入记录的**清除回执**，请妥善保存。无效/空 body 返回 `400`；存储数据超过 2 KiB 返回 `413`。 |
+| POST | `/write` | 发送 JSON 表单，如 `{"name":"alice","value":"hello"}`。提取配置字段（`web_server.c` 中的 `WRITE_FIELDS`，默认 `name`、`value`），**加密**后持久化到 flash。成功返回 `{"status":"ok","bytes":N,"pk":"<64位hex>","sk":"<64位hex>"}`：`pk`/`sk` 是本次写入记录的**清除回执**，请妥善保存。无效/空 body 返回 `400`；存储数据超过 2 KiB 返回 `413`。该端点带宽松 CORS 头（`Access-Control-Allow-Origin: *`）并支持 OPTIONS 预检，主机侧网页可跨域 POST 并读取响应。 |
 | GET  | `/print` | 以 `application/json` 返回已存储的数据（读取时实时解密）；无有效数据时返回 `{"status":"empty"}`。该端点仅在 `DEBUG=1`（`tusb_config.h`）时编译进固件，默认固件下返回 `404`。 |
 | GET  | `/sign` | 端点描述：`{"endpoint":"/sign","method":"POST","fields":["challenge","context","timestamp"]}`。 |
 | POST | `/sign` | 用固件内置的 Ed25519 密钥对消息 `<challenge>:<context>:<timestamp>:device_001` 签名（自旧版固件迁移）。返回 `{"signature":"<base64>","timestamp":"<原样回显>","device_id":"device_001"}`；空 body/缺字段/格式错误返回 `400`。 |
@@ -81,8 +81,9 @@ python sign_verify.py 'abc:login:2024-06-01T12:00:00Z:device_001' '<sign 返回�
 # OK: signature is valid for this message and key
 ```
 
-只有 `/sign` 的响应带 CORS 头并接受 OPTIONS 预检，方便主机上的网页调用；
-`/write`、`/print`、`/clear` 刻意不加 CORS，随机网页无法跨域读取回执或存储数据。
+`/write` 与 `/sign` 的响应带宽松 CORS 头（`Access-Control-Allow-Origin: *`）并接受
+OPTIONS 预检，主机上的网页可以跨域调用并读取响应；`/print`、`/clear` 刻意不加
+CORS，随机网页无法跨域读取存储数据，也无法预检触发擦除。
 
 **2 KiB 限制**针对的是*存储后的 JSON*（包含字段名、引号和花括号），而不是单纯的
 value。对固定 9 字符 `name` 的载荷，固定开销为 31 字节，因此可接受的 value 上限是

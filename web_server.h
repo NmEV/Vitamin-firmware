@@ -6,7 +6,9 @@
 //                success, 400 bad/invalid body, 413 payload too large. The
 //                success response includes the fresh pk/sk (64 hex chars each)
 //                that sealed the record: keep them, they are the clear
-//                receipt for this record.
+//                receipt for this record. CORS-enabled (Access-Control-Allow-*)
+//                with OPTIONS preflight, so browser apps on the host can POST
+//                and read the response; /print and /clear stay CORS-free.
 //   GET  /print  returns the stored data (application/json). Only compiled in
 //                when DEBUG=1 in tusb_config.h (default 0): in release builds
 //                this path is answered 404 like any unknown route.

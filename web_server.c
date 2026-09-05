@@ -371,10 +371,10 @@ static void release_conn(http_conn_t *c) {
 // response / routing
 // ---------------------------------------------------------------------------
 
-// cors=true additionally sends the Access-Control-Allow-* headers. Only the
-// /sign endpoint uses this (browser clients POSTing a challenge need to read
-// the signed response); /write, /print and /clear deliberately stay CORS-free
-// so a random web page cannot read receipts or stored data cross-origin.
+// cors=true additionally sends the Access-Control-Allow-* headers. /write and
+// /sign answer with them so browser apps on the host can POST and read the
+// responses cross-origin; /print and /clear deliberately stay CORS-free so a
+// random web page cannot read the stored data nor preflight a wipe.
 static void respond_ex(http_conn_t *c, struct tcp_pcb *pcb, const char *status, const char *body, size_t body_len,
                        bool cors) {
     char head[320];
@@ -450,13 +450,13 @@ static void handle_write(http_conn_t *c, struct tcp_pcb *pcb) {
     const char *json = (const char *)c->buf + c->body_start;
     size_t jlen = c->content_length;
     if (jlen == 0) {
-        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"bad or empty body\"}");
+        respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"bad or empty body\"}");
         return;
     }
     if (jlen > STORAGE_MAX_PAYLOAD + 256) {
         // Far beyond anything that could ever be stored: reject up front (the
         // exact 2 KiB stored-JSON check below still applies near the limit).
-        respond_err(c, pcb, "413 Payload Too Large", "{\"status\":\"error\",\"error\":\"payload too large\"}");
+        respond_err_cors(c, pcb, "413 Payload Too Large", "{\"status\":\"error\",\"error\":\"payload too large\"}");
         return;
     }
 
@@ -466,7 +466,7 @@ static void handle_write(http_conn_t *c, struct tcp_pcb *pcb) {
     for (size_t i = 0; i < WRITE_FIELDS_COUNT; ++i) {
         json_field_result_t r = json_get_string(json, jlen, WRITE_FIELDS[i], field_vals[i], sizeof(field_vals[i]));
         if (r == JSON_FIELD_INVALID) {
-            respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"malformed json body\"}");
+            respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"malformed json body\"}");
             return;
         }
         has[i] = (r == JSON_FIELD_FOUND);
@@ -474,7 +474,7 @@ static void handle_write(http_conn_t *c, struct tcp_pcb *pcb) {
     bool any = false;
     for (size_t i = 0; i < WRITE_FIELDS_COUNT; ++i) any = any || has[i];
     if (!any) {
-        respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"no known form fields\"}");
+        respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"no known form fields\"}");
         return;
     }
 
@@ -510,12 +510,12 @@ static void handle_write(http_conn_t *c, struct tcp_pcb *pcb) {
     }
 
     if (overflow || o > STORAGE_MAX_PAYLOAD) {
-        respond_err(c, pcb, "413 Payload Too Large", "{\"status\":\"error\",\"error\":\"payload too large\"}");
+        respond_err_cors(c, pcb, "413 Payload Too Large", "{\"status\":\"error\",\"error\":\"payload too large\"}");
         return;
     }
     uint8_t pk[32], sk[32];
     if (!storage_write((const uint8_t *)stored, o, pk, sk)) {
-        respond_err(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"flash write failed\"}");
+        respond_err_cors(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"flash write failed\"}");
         return;
     }
     // The success response doubles as the writer's receipt: POST /clear only
@@ -529,10 +529,10 @@ static void handle_write(http_conn_t *c, struct tcp_pcb *pcb) {
                      "{\"status\":\"ok\",\"bytes\":%u,\"pk\":\"%s\",\"sk\":\"%s\"}",
                      (unsigned)o, pk_hex, sk_hex);
     if (n < 0 || (size_t)n >= sizeof(ok)) {
-        respond_err(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"internal error\"}");
+        respond_err_cors(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"internal error\"}");
         return;
     }
-    respond(c, pcb, "200 OK", ok, (size_t)n);
+    respond_cors(c, pcb, "200 OK", ok, (size_t)n);
 }
 
 static void handle_print(http_conn_t *c, struct tcp_pcb *pcb) {
@@ -678,13 +678,15 @@ static void handle_clear(http_conn_t *c, struct tcp_pcb *pcb) {
 static void handle_request(http_conn_t *c, struct tcp_pcb *pcb) {
     if (strcmp(c->method, "POST") == 0 && strcmp(c->path, "/write") == 0) {
         handle_write(c, pcb);
+    } else if (strcmp(c->method, "OPTIONS") == 0 && strcmp(c->path, "/write") == 0) {
+        // CORS preflight for browser clients that POST to /write.
+        respond_cors(c, pcb, "200 OK", "", 0);
     } else if (strcmp(c->method, "GET") == 0 && strcmp(c->path, "/print") == 0) {
         handle_print(c, pcb);
     } else if (strcmp(c->path, "/sign") == 0) {
-        // Ed25519 signing endpoint (see the section above). Browser clients
-        // need CORS, so this path answers with Access-Control-Allow-* headers
-        // and accepts the OPTIONS preflight; the data endpoints (/write,
-        // /print, /clear) intentionally stay CORS-free.
+        // Ed25519 signing endpoint (see the section above). Like /write, this
+        // path answers with Access-Control-Allow-* headers and accepts the
+        // OPTIONS preflight; /print and /clear intentionally stay CORS-free.
         if (strcmp(c->method, "POST") == 0) {
             handle_sign(c, pcb);
         } else if (strcmp(c->method, "GET") == 0) {
