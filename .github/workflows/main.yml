@@ -150,18 +150,33 @@ jobs:
       - name: Stage release assets
         run: |
           set -euo pipefail
+      
           mkdir -p assets
-          # Convenience top-level files (the .uf2 is what you flash), plus the
-          # original per-board zips with elf/bin/map for debugging.
-          cp artifacts/pico/build/usbnet.uf2  assets/usbnet-pico.uf2
-          cp artifacts/pico/build/usbnet.elf  assets/usbnet-pico.elf
-          cp artifacts/pico/build/usbnet.map  assets/usbnet-pico.map
-          cp artifacts/pico2/build/usbnet.uf2 assets/usbnet-pico2.uf2
-          cp artifacts/pico2/build/usbnet.elf assets/usbnet-pico2.elf
-          cp artifacts/pico2/build/usbnet.map assets/usbnet-pico2.map
-          (cd artifacts/pico  && zip -qr ../usbnet-firmware-pico.zip  build)
-          (cd artifacts/pico2 && zip -qr ../usbnet-firmware-pico2.zip build)
-          ls -l assets artifacts/*.zip
+      
+          # pico (RP2040)
+          cp artifacts/pico/usbnet.uf2 assets/usbnet-pico.uf2
+          cp artifacts/pico/usbnet.elf assets/usbnet-pico.elf
+          cp artifacts/pico/usbnet.map assets/usbnet-pico.map
+      
+          # pico2 (RP2350)
+          cp artifacts/pico2/usbnet.uf2 assets/usbnet-pico2.uf2
+          cp artifacts/pico2/usbnet.elf assets/usbnet-pico2.elf
+          cp artifacts/pico2/usbnet.map assets/usbnet-pico2.map
+      
+          # 打包每个板子的完整调试文件
+          (
+            cd artifacts/pico
+            zip -qr ../usbnet-firmware-pico.zip .
+          )
+      
+          (
+            cd artifacts/pico2
+            zip -qr ../usbnet-firmware-pico2.zip .
+          )
+      
+          echo "=== Final release assets ==="
+          find assets -type f -printf '%p\n' | sort
+          ls -lh artifacts/*.zip
 
       - name: Remove previous fixed-tag release
         run: |
