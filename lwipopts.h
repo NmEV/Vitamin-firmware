@@ -32,6 +32,12 @@
 #define LWIP_ETHERNET 1
 #define LWIP_ICMP 1
 #define LWIP_RAW 1
+// IPv6 stays off, on purpose: lwIP's mDNS responder is IPv4-only, and
+// main.c / dhcpserver/dhcpserver.h pass ip4_addr_t pointers where
+// ip_addr_t is expected - those casts are only layout-safe while
+// LWIP_IPV6 == 0 (ip_addr_t then *is* ip4_addr_t). Do not enable IPv6
+// without reworking the DHCP server API and the netif setup first.
+#define LWIP_IPV6 0
 #define TCP_WND (8 * TCP_MSS)
 #define TCP_MSS 1460
 #define TCP_SND_BUF (8 * TCP_MSS)

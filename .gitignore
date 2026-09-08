@@ -1,4 +1,7 @@
 build
+build-*/
 __pycache__/
+arm-toolchain/
+pico-sdk/
 firmware/
 

@@ -204,6 +204,9 @@ make -j$(nproc)
 - 字段配置：`web_server.c` 中的 `WRITE_FIELDS`（默认为 `name`、`value`）。
 - `flash_program.c` 是官方 flash 读写示例，仅作参考，**不参与编译**（它自带
   `main`）。
+- `firmware/` 是 **gitignored 的旧版工程布局副本**（旧版 HTTP 服务
+  `micro-cilent.c`、LED 代码、SDK 2.2），**不参与本工程编译**，仅存在于本地
+  检出中；请勿编辑其中的文件——真正参与构建的是仓库根目录下的同名源码。
 - `tweetnacl.c` / `tweetnacl.h` 是内置的单文件 TweetNaCl 实现，用于
   `crypto_box`、`crypto_box_open` 与 `randombytes`。
 - Pico W / Pico 2 W 若需使用 CYW43 功能：先调用 `cyw43_arch_init()`，再以
@@ -211,7 +214,20 @@ make -j$(nproc)
   `pico_cyw43_arch_lwip_poll` 库，可以去掉 `pico_lwip*` 系列库。
 - stdio 输出走 UART；发送字符 `'s'` 可演示一次干净的关机流程。
 - 仅支持 HTTP 的一个小子集（GET/POST、`Content-Length`、`Connection: close`
-  响应）；curl、浏览器、Postman 等常见客户端均可正常使用。
+  响应）；curl、浏览器、Postman 等常见客户端均可正常使用。已知路径配未知
+  方法一律回 `405`（`/sign`、`/clear`、`/write` 另接受 OPTIONS 预检），未知
+  路径回 `404`。路径按字面匹配、不剥离 `?query`，因此 `/write?x=1` 是 404。
+- **`/sign` 的密钥是公开常量**（内嵌于固件镜像与本仓库）：任何人都能提取并
+  伪造 `device_001` 的签名。该端点仅为兼容旧版固件的既有验签方而保留，
+  **不可用作设备认证**。
+- **`/write` 带宽松 CORS 且无需回执**：主机访问过的任意网页都能覆写存储
+  记录（属数据破坏，不泄露机密）；`/clear` 仍须回执、`/print` 不加 CORS 且
+  需 `DEBUG=1` 构建才能读回。
+- 每次写入的 crypto_box 密钥/nonce 由 `pico_rand` 产生：RP2350 上是硬件
+  TRNG，RP2040 上是 ROSC 环形振荡器派生的伪随机源（非真熵源）。对本文的
+  威胁模型够用，不宜用于长期密钥保护。
+- 存储写入是先擦后写且无备份槽：擦除与编程之间断电（或编程失败）会丢失
+  旧记录，下次 `/write` 从空槽重新开始。
 
 ## 致谢
 

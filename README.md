@@ -243,6 +243,10 @@ the CI overrides it to `pico2`.
 - Fields: `WRITE_FIELDS` in `web_server.c` (defaults to `name`, `value`).
 - `flash_program.c` is the upstream reference for the flash write/read
   pattern and is **not part of the build** (it has its own `main`).
+- `firmware/` is a **stale, gitignored copy of an earlier project layout**
+  (legacy HTTP server `micro-cilent.c`, LED code, SDK 2.2) that is **not part
+  of this build**; it only exists in local checkouts. Do not edit it - the
+  files at the repository root are the ones that build.
 - `tweetnacl.c`/`tweetnacl.h` are the bundled single-file TweetNaCl
   implementation used for `crypto_box`, `crypto_box_open` and `randombytes`.
 - For Pico W / Pico 2 W with CYW43-specific functionality: call
@@ -252,7 +256,25 @@ the CI overrides it to `pico2`.
 - stdio goes out over UART; sending `'s'` demonstrates a clean shutdown.
 - Only a small subset of HTTP is supported (GET/POST, `Content-Length`,
   `Connection: close` responses); a client such as curl, a browser or Postman
-  works fine.
+  works fine. Known endpoints reached with any other method answer `405`
+  (`/sign`, `/clear` and `/write` also accept the `OPTIONS` preflight), and
+  unknown paths answer `404`. Request paths are matched literally: a `?query`
+  string is not stripped, so `/write?x=1` is a 404.
+- **`/sign` keys are public constants** (embedded in the firmware image and in
+  this repository): anyone can extract them and forge signatures for
+  `device_001`. The endpoint exists for compatibility with the legacy
+  firmware's verifiers; it must not be used as device authentication.
+- **`/write` is CORS-open (`Access-Control-Allow-Origin: *`) and needs no
+  receipt**: any website visited by the host can overwrite the stored record
+  (data loss, not a secrecy leak). `/clear` still requires the receipt and
+  `/print` sends no CORS headers; read-back needs a `DEBUG=1` build.
+- Randomness for the per-write crypto_box keys/nonces comes from `pico_rand`:
+  on RP2350 that is the hardware TRNG, on RP2040 it is derived from the ROSC
+  ring oscillator (not a true entropy source). Fine for this threat model,
+  not suitable for long-term key protection.
+- Storage writes are erase-then-program with no backup slot: a power loss (or
+  a failed program step) between the erase and the program loses the previous
+  record. The next `/write` simply starts from an empty slot.
 
 ## Credits
 

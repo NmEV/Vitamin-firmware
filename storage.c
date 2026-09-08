@@ -275,6 +275,16 @@ bool storage_write(const uint8_t *src, size_t len, uint8_t out_pk[STORAGE_KEY_LE
 }
 
 bool storage_clear(void) {
+    // An already-erased slot (flash reads 0xFF; the on-flash magic is absent)
+    // needs no erase cycle. Skipping it avoids pointless flash wear and the
+    // erase-time stall on every no-op POST /clear (which is answered 200 on an
+    // empty slot by design). A partial/foreign record whose magic is missing
+    // is still left in place here - storage_available() already treats it as
+    // empty, and the next storage_write() erases the sector unconditionally.
+    if (storage_flash[0] == 0xFF && storage_flash[1] == 0xFF && storage_flash[2] == 0xFF &&
+        storage_flash[3] == 0xFF) {
+        return true;
+    }
     int rc = flash_safe_execute(storage_erase_cb, NULL, UINT32_MAX);
     return rc == PICO_OK;
 }

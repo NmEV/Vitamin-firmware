@@ -578,7 +578,11 @@ static void handle_sign(http_conn_t *c, struct tcp_pcb *pcb) {
         {"context", 128},
         {"timestamp", 128},
     };
-    char vals[3][256]; // sized to the largest cap above
+    // Staging buffers are static (same pattern as handle_write/handle_print):
+    // keeping ~1.8 KB of scratch off the stack is what keeps the POST /sign
+    // callback chain (lwIP TCP -> handle_sign -> crypto_sign -> crypto_hash)
+    // inside the 4 KiB stack budget, see pico_config.h.
+    static char vals[3][256]; // sized to the largest cap above
     for (size_t i = 0; i < 3; ++i) {
         json_field_result_t r = json_get_string(json, jlen, sign_fields[i].key, vals[i], sign_fields[i].cap);
         if (r == JSON_FIELD_INVALID) {
@@ -599,7 +603,7 @@ static void handle_sign(http_conn_t *c, struct tcp_pcb *pcb) {
     }
 
     // Message format (legacy-compatible): challenge:context:timestamp:device_id
-    char msg[1024];
+    static char msg[1024];
     int msg_len = snprintf(msg, sizeof(msg), "%s:%s:%s:%s", vals[0], vals[1], vals[2], DEVICE_ID);
     if (msg_len < 0 || (size_t)msg_len >= sizeof(msg)) {
         respond_err_cors(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"message too long\"}");
@@ -614,10 +618,25 @@ static void handle_sign(http_conn_t *c, struct tcp_pcb *pcb) {
     }
     base64_encode(sign_sm, 64, sign_b64); // Ed25519 signature = first 64 bytes
 
-    char out[256];
+    // The timestamp is echoed in the response: json_get_string() decoded it,
+    // so it may contain '"', '\\' or control characters that would otherwise
+    // be spliced into the JSON response unescaped, producing an unparseable
+    // body. Re-escape it exactly like /write does for stored values. These
+    // staging buffers are static (as elsewhere in this single-threaded
+    // server) to keep the stack budget small: this callback chain already
+    // runs deep (lwIP TCP -> crypto_sign, see pico_config.h). ts_esc is sized
+    // for the worst-case expansion of the field cap (timestamp cap 128 -> at
+    // most 127 decoded chars, each <= 6 bytes when escaped), so the escape
+    // can never be truncated; out is sized for the serialised response, and
+    // any (impossible) overflow is reported as 500 below.
+    static char ts_esc[6 * 128 + 2];
+    static char out[512];
+    size_t ts_esc_len = json_append_escaped(ts_esc, sizeof(ts_esc), vals[2]);
+    ts_esc[ts_esc_len] = '\0';
+
     int n = snprintf(out, sizeof(out),
                      "{\"signature\":\"%s\",\"timestamp\":\"%s\",\"device_id\":\"%s\"}",
-                     sign_b64, vals[2], DEVICE_ID);
+                     sign_b64, ts_esc, DEVICE_ID);
     if (n < 0 || (size_t)n >= sizeof(out)) {
         respond_err_cors(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"internal error\"}");
         return;
@@ -711,6 +730,11 @@ static void handle_request(http_conn_t *c, struct tcp_pcb *pcb) {
         } else {
             respond_err(c, pcb, "405 Method Not Allowed", "{\"status\":\"error\",\"error\":\"POST /clear with the key pair from the last /write\"}");
         }
+    } else if (strcmp(c->path, "/write") == 0 || strcmp(c->path, "/print") == 0 ||
+               strcmp(c->path, "/sign") == 0 || strcmp(c->path, "/clear") == 0) {
+        // A known endpoint with an unsupported method (PATCH /write, POST
+        // /print, ...): 405 rather than pretending the resource is absent.
+        respond_err(c, pcb, "405 Method Not Allowed", "{\"status\":\"error\",\"error\":\"method not allowed\"}");
     } else {
         respond_err(c, pcb, "404 Not Found", "{\"status\":\"error\",\"error\":\"not found\"}");
     }
@@ -729,6 +753,13 @@ static void parse_request(http_conn_t *c) {
         return; // wait for more data
     }
     size_t he_off = (size_t)(he - c->buf);
+    if (he_off + 4 > WEB_HEADER_LIMIT) {
+        // The header block (through the blank line) exceeds the documented
+        // cap even though a terminator exists: reject instead of parsing an
+        // arbitrarily large header area.
+        respond_err(c, c->pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"headers too large\"}");
+        return;
+    }
 
     // Request line: first CRLF.
     const char *line = (const char *)c->buf;
