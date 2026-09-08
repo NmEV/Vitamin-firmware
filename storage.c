@@ -141,6 +141,33 @@ bool storage_available(void) {
     return len > 0 && len <= STORAGE_MAX_PAYLOAD;
 }
 
+bool storage_get_info(storage_info_t *out) {
+    if (out == NULL) {
+        return false;
+    }
+    out->format_version = storage_flash[STORAGE_MAGIC_LEN]; // raw byte (0xFF erased)
+    out->payload_len = 0;
+    if (memcmp(storage_flash, "USBN", STORAGE_MAGIC_LEN) == 0 &&
+        storage_flash[STORAGE_MAGIC_LEN] == STORAGE_FORMAT_VERSION) {
+        // Magic and format version match; the record is valid only when the
+        // stored plaintext length is sane (mirrors storage_available()).
+        uint32_t len;
+        memcpy(&len, storage_flash + STORAGE_LEN_OFF, sizeof(len));
+        if (len > 0 && len <= STORAGE_MAX_PAYLOAD) {
+            out->state = STORAGE_STATE_VALID;
+            out->payload_len = len;
+        } else {
+            out->state = STORAGE_STATE_OTHER; // corrupt length field
+        }
+    } else if (storage_flash[0] == 0xFF && storage_flash[1] == 0xFF &&
+               storage_flash[2] == 0xFF && storage_flash[3] == 0xFF) {
+        out->state = STORAGE_STATE_EMPTY; // erased slot (same check as storage_clear)
+    } else {
+        out->state = STORAGE_STATE_OTHER; // foreign/legacy/partial record
+    }
+    return true;
+}
+
 // Constant-time-ish comparison against the key pair in the record header:
 // the loop always runs over every byte of both keys, so a mismatch does not
 // reveal which byte differed.

@@ -9,9 +9,15 @@
 //                receipt for this record. CORS-enabled (Access-Control-Allow-*)
 //                with OPTIONS preflight, so browser apps on the host can POST
 //                and read the response; /print stays CORS-free.
-//   GET  /print  returns the stored data (application/json). Only compiled in
-//                when DEBUG=1 in tusb_config.h (default 0): in release builds
-//                this path is answered 404 like any unknown route.
+//   GET  /print  returns the stored data (application/json). Compiled in
+//                when DEBUG=1 in tusb_config.h (default 1); when DEBUG=0 this
+//                path is answered 404 like any unknown route.
+//   GET  /print?debug=1
+//                full diagnostic document: firmware info, uptime, reset
+//                reason, USB/netif state, storage state (with the decrypted
+//                payload), HTTP connection pool, DHCP leases, lwIP heap/pool
+//                statistics. Same DEBUG gating; never contains key material.
+//                /print (both forms) sends no CORS headers.
 //   POST /clear  erases the stored data, but only when the JSON body carries
 //                the exact pk/sk returned by the /write of the current
 //                record: 403 on a mismatch (data untouched), 400 on a
@@ -30,6 +36,8 @@
 #ifndef WEB_SERVER_H
 #define WEB_SERVER_H
 
+#include "dhcpserver/dhcpserver.h" // dhcp_server_t for web_server_set_dhcp()
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -37,6 +45,11 @@ extern "C" {
 // Creates the listening TCP socket on port 80. Safe to call once after the
 // network interface is up. Returns true on success.
 bool web_server_init(void);
+
+// Optionally registers the DHCP server so the /print?debug=1 document can
+// report the current lease table (read-only, may be NULL). Call after
+// dhcp_server_init(). Passing NULL clears the reference.
+void web_server_set_dhcp(const dhcp_server_t *d);
 
 #ifdef __cplusplus
 }

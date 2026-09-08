@@ -9,6 +9,10 @@
 //                   record: that pair is the writer's clear-receipt.
 //   GET  /print  -> return the stored data (only compiled in when DEBUG=1 in
 //                   tusb_config.h; otherwise this path answers 404)
+//   GET  /print?debug=1 -> full diagnostic document (firmware, uptime, netif,
+//                   storage state + decrypted payload, HTTP connection pool,
+//                   DHCP leases, lwIP heap/pool stats). Same DEBUG gating.
+//                   No CORS headers on either /print form.
 //   POST /clear  -> erase the stored data, but only when the JSON body's pk/sk
 //                   exactly match the current record's key pair (403 on a
 //                   mismatch; 400 on a missing/malformed pair). A record-less
@@ -23,6 +27,7 @@
 // the POST body); a compliant client (curl, a browser, Postman) is sufficient.
 // Each response uses "Connection: close".
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,16 +35,22 @@
 
 #include "lwip/ip.h"
 #include "lwip/ip_addr.h"
+#include "lwip/netif.h" // netif_default
+#include "lwip/stats.h" // lwip_stats (MEM_STATS/MEMP_STATS)
 #include "lwip/tcp.h"
 
-// tusb_config.h normally compiles only inside TinyUSB translation units, where
-// the build provides CFG_TUSB_MCU. This TU only needs the project's DEBUG
-// switch from that header, so satisfy its guard with a placeholder value:
-// tusb_config.h itself never uses CFG_TUSB_MCU.
-#ifndef CFG_TUSB_MCU
-#define CFG_TUSB_MCU 0
-#endif
-#include "tusb_config.h"
+// Direct register read (no library call): both RP2040 and RP2350 expose the
+// last-reset reason in the watchdog block (see hardware/structs/watchdog.h).
+#include "hardware/structs/watchdog.h"
+#include "pico/time.h" // to_ms_since_boot() (debug endpoint)
+
+#include "dhcpserver/dhcpserver.h" // lease table (debug endpoint)
+
+// tusb.h pulls in tusb_config.h (project DEBUG switch and USB config). The
+// build provides CFG_TUSB_MCU via the tinyusb_device target, exactly as for
+// usb_network.c/usb_descriptors.c; tud_ready() is a header-inline in this
+// TinyUSB version, so it must not be redeclared as an extern function.
+#include "tusb.h"
 
 #include "storage.h"
 #include "tweetnacl.h"
@@ -79,6 +90,10 @@ static http_conn_t http_conns[WEB_MAX_CONNS];
 
 // Response staging buffer (single-threaded, so one shared buffer is fine).
 static uint8_t resp_buf[WEB_BUF_SIZE];
+
+// Optional pointer to the DHCP server (registered by main.c) so the debug
+// endpoint can report the lease table. Read-only, may stay NULL.
+static const dhcp_server_t *dbg_dhcp = NULL;
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -536,8 +551,216 @@ static void handle_write(http_conn_t *c, struct tcp_pcb *pcb) {
     respond_cors(c, pcb, "200 OK", ok, (size_t)n);
 }
 
-static void handle_print(http_conn_t *c, struct tcp_pcb *pcb) {
+// ---------------------------------------------------------------------------
+// /print?debug=1 diagnostic document builder
+// ---------------------------------------------------------------------------
+// Everything is assembled into a static buffer (stack discipline: this
+// callback chain already runs deep, see pico_config.h) and answered WITHOUT
+// CORS headers, like the plain /print payload. Never emits key material: no
+// pk/sk receipt, nonce or ciphertext leaves the device.
+
 #if DEBUG
+
+// Appends a formatted chunk to a bounded buffer. Returns false (and the
+// caller answers 500) when the document would not fit.
+static bool dbg_append(char *buf, size_t cap, size_t *off, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *off, cap - *off, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - *off) {
+        return false; // truncation or formatting error: document too large
+    }
+    *off += (size_t)n;
+    return true;
+}
+
+// Renders a 4-byte network-order IPv4 address as a.b.c.d.
+static void dbg_ip4(char *out, size_t cap, uint32_t v) {
+    const uint8_t *b = (const uint8_t *)&v;
+    snprintf(out, cap, "%u.%u.%u.%u", (unsigned)b[0], (unsigned)b[1], (unsigned)b[2], (unsigned)b[3]);
+}
+
+// Renders a MAC as AA:BB:CC:DD:EE:FF.
+static void dbg_mac(char *out, size_t cap, const uint8_t mac[6]) {
+    snprintf(out, cap, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// Board name from toolchain-level macros (compiler built-ins, reliable on
+// both cores/ISAs without any SDK-platform header).
+static const char *dbg_board_name(void) {
+#if defined(__riscv)
+    return "rp2350-riscv";
+#elif defined(__ARM_ARCH_8M_MAIN__)
+    return "rp2350";
+#elif defined(__ARM_ARCH_6M__)
+    return "rp2040";
+#else
+    return "unknown";
+#endif
+}
+
+static void handle_print_debug(http_conn_t *c, struct tcp_pcb *pcb) {
+    static char doc[3072];
+    size_t off = 0;
+    const size_t cap = sizeof(doc);
+    bool ok = true;
+
+    ok = ok && dbg_append(doc, cap, &off, "{\"firmware\":{\"name\":\"usbnet\",\"version\":\"0.1\",\"debug\":1,");
+#ifdef PICO_SDK_VERSION_STRING
+    ok = ok && dbg_append(doc, cap, &off, "\"sdk\":\"%s\",", PICO_SDK_VERSION_STRING);
+#else
+    ok = ok && dbg_append(doc, cap, &off, "\"sdk\":\"unknown\",");
+#endif
+    ok = ok && dbg_append(doc, cap, &off, "\"board\":\"%s\"},", dbg_board_name());
+    ok = ok && dbg_append(doc, cap, &off, "\"uptime_s\":%lu,",
+                          (unsigned long)(to_ms_since_boot(get_absolute_time()) / 1000));
+    ok = ok && dbg_append(doc, cap, &off, "\"reset_reason\":\"0x%08lx\",", (unsigned long)watchdog_hw->reason);
+    ok = ok && dbg_append(doc, cap, &off, "\"usb\":{\"link_up\":%s},",
+                          tud_ready() ? "true" : "false");
+
+    // Network interface (netif_default is NULL until usb_network_init).
+    if (netif_default != NULL) {
+        char ip[16], nm[16], gw[16], mac[18];
+        dbg_ip4(ip, sizeof(ip), ip4_addr_get_u32(&netif_default->ip_addr));
+        dbg_ip4(nm, sizeof(nm), ip4_addr_get_u32(&netif_default->netmask));
+        dbg_ip4(gw, sizeof(gw), ip4_addr_get_u32(&netif_default->gw));
+        if (netif_default->hwaddr_len == 6) {
+            dbg_mac(mac, sizeof(mac), netif_default->hwaddr);
+        } else {
+            snprintf(mac, sizeof(mac), "none");
+        }
+        ok = ok && dbg_append(doc, cap, &off,
+                              "\"netif\":{\"up\":%s,\"ip\":\"%s\",\"netmask\":\"%s\",\"gw\":\"%s\",\"mtu\":%u,\"mac\":\"%s\"},",
+                              (netif_default->flags & NETIF_FLAG_UP) ? "true" : "false", ip, nm, gw,
+                              (unsigned)netif_default->mtu, mac);
+    } else {
+        ok = ok && dbg_append(doc, cap, &off, "\"netif\":null,");
+    }
+
+    // Storage slot state (no key material) + decrypted payload when valid.
+    storage_info_t info;
+    storage_get_info(&info);
+    static const char *state_names[] = {"empty", "valid", "other"};
+    ok = ok && dbg_append(doc, cap, &off,
+                          "\"storage\":{\"state\":\"%s\",\"format_version\":%u",
+                          state_names[info.state], (unsigned)info.format_version);
+    if (info.state == STORAGE_STATE_VALID) {
+        ok = ok && dbg_append(doc, cap, &off, ",\"payload_len\":%lu,\"sections\":%lu",
+                              (unsigned long)info.payload_len,
+                              (unsigned long)((info.payload_len + 255) / 256));
+    }
+    static uint8_t payload[STORAGE_MAX_PAYLOAD];
+    size_t plen = storage_read(payload, sizeof(payload));
+    ok = ok && dbg_append(doc, cap, &off, ",\"payload\":");
+    if (plen > 0) {
+        // The stored payload is the JSON document written by /write: splice it
+        // in verbatim so it stays byte-identical to what /print returns.
+        if (off + plen + 1 >= cap) {
+            ok = false;
+        } else {
+            memcpy(doc + off, payload, plen);
+            off += plen;
+        }
+    } else {
+        ok = ok && dbg_append(doc, cap, &off, "null");
+    }
+    ok = ok && dbg_append(doc, cap, &off, "},");
+
+    // HTTP connection pool state.
+    ok = ok && dbg_append(doc, cap, &off, "\"http\":{\"max_conns\":%u,\"connections\":[",
+                          (unsigned)WEB_MAX_CONNS);
+    bool first = true;
+    for (int i = 0; i < WEB_MAX_CONNS; ++i) {
+        const http_conn_t *conn = &http_conns[i];
+        const char *phase = conn->responded ? "responded"
+                            : (conn->headers_done ? "complete" : "receiving");
+        ok = ok && dbg_append(doc, cap, &off, "%s{\"slot\":%d,\"active\":%s,\"phase\":\"%s\",\"buffered\":%u,\"idle\":%u}",
+                              first ? "" : ",", i, conn->active ? "true" : "false", phase,
+                              (unsigned)conn->len, (unsigned)conn->idle);
+        first = false;
+    }
+    ok = ok && dbg_append(doc, cap, &off, "]},");
+
+    // DHCP lease table (registered via web_server_set_dhcp(); approximations
+    // follow the dhcpserver's own truncated expiry arithmetic).
+    ok = ok && dbg_append(doc, cap, &off, "\"dhcp\":{\"enabled\":%s,\"leases\":[",
+                          dbg_dhcp != NULL ? "true" : "false");
+    first = true;
+    if (dbg_dhcp != NULL) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        for (int i = 0; i < DHCPS_MAX_IP; ++i) {
+            const dhcp_server_lease_t *lease = &dbg_dhcp->lease[i];
+            bool used = lease->mac[0] != 0 || lease->mac[1] != 0 || lease->mac[2] != 0 ||
+                        lease->mac[3] != 0 || lease->mac[4] != 0 || lease->mac[5] != 0;
+            if (!used) {
+                continue;
+            }
+            char mac[18];
+            dbg_mac(mac, sizeof(mac), lease->mac);
+            uint32_t exp_ms = ((uint32_t)lease->expiry << 16) | 0xffffu;
+            int32_t rem_ms = (int32_t)(exp_ms - now);
+            unsigned long rem_s = rem_ms > 0 ? (unsigned long)(rem_ms / 1000) : 0;
+            ok = ok && dbg_append(doc, cap, &off, "%s{\"index\":%d,\"mac\":\"%s\",\"expires_in_s\":%lu}",
+                                  first ? "" : ",", i, mac, rem_s);
+            first = false;
+        }
+    }
+    ok = ok && dbg_append(doc, cap, &off, "]},");
+
+    // lwIP heap + key pool stats (LWIP_STATS/MEM_STATS/MEMP_STATS in lwipopts.h).
+#if LWIP_STATS && MEM_STATS
+    ok = ok && dbg_append(doc, cap, &off,
+                          "\"heap\":{\"avail\":%u,\"used\":%u,\"max\":%u,\"err\":%u},",
+                          (unsigned)lwip_stats.mem.avail, (unsigned)lwip_stats.mem.used,
+                          (unsigned)lwip_stats.mem.max, (unsigned)lwip_stats.mem.err);
+#else
+    ok = ok && dbg_append(doc, cap, &off, "\"heap\":null,");
+#endif
+#if LWIP_STATS && MEMP_STATS
+    ok = ok && dbg_append(doc, cap, &off, "\"pools\":[");
+    first = true;
+    {
+        static const struct {
+            int idx;
+            const char *name;
+        } pool_sel[] = {
+            {MEMP_PBUF_POOL, "PBUF_POOL"},
+            {MEMP_TCP_SEG, "TCP_SEG"},
+            {MEMP_TCP_PCB, "TCP_PCB"},
+        };
+        for (size_t s = 0; s < sizeof(pool_sel) / sizeof(pool_sel[0]); ++s) {
+            struct stats_mem *p = lwip_stats.memp[pool_sel[s].idx];
+            if (p == NULL) {
+                continue; // pool not initialised yet
+            }
+            ok = ok && dbg_append(doc, cap, &off, "%s{\"name\":\"%s\",\"avail\":%u,\"used\":%u,\"max\":%u,\"err\":%u}",
+                                  first ? "" : ",", pool_sel[s].name, (unsigned)p->avail,
+                                  (unsigned)p->used, (unsigned)p->max, (unsigned)p->err);
+            first = false;
+        }
+    }
+    ok = ok && dbg_append(doc, cap, &off, "]}");
+#else
+    ok = ok && dbg_append(doc, cap, &off, "\"pools\":[]");
+#endif
+    ok = ok && dbg_append(doc, cap, &off, "}\n");
+
+    if (!ok) {
+        respond_err(c, pcb, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"debug document too large\"}");
+        return;
+    }
+    respond(c, pcb, "200 OK", doc, off);
+}
+
+#endif // DEBUG
+
+static void handle_print(http_conn_t *c, struct tcp_pcb *pcb, bool debug_mode) {
+#if DEBUG
+    if (debug_mode) {
+        handle_print_debug(c, pcb);
+        return;
+    }
     static uint8_t data[STORAGE_MAX_PAYLOAD];
     size_t n = storage_read(data, sizeof(data));
     if (n > 0) {
@@ -546,6 +769,7 @@ static void handle_print(http_conn_t *c, struct tcp_pcb *pcb) {
         respond_err(c, pcb, "200 OK", "{\"status\":\"empty\"}");
     }
 #else
+    (void)debug_mode;
     // /print is a debug read-back endpoint: unless the firmware was built with
     // DEBUG=1 (see tusb_config.h) it behaves exactly like any unknown path.
     respond_err(c, pcb, "404 Not Found", "{\"status\":\"error\",\"error\":\"not found\"}");
@@ -696,13 +920,34 @@ static void handle_clear(http_conn_t *c, struct tcp_pcb *pcb) {
 }
 
 static void handle_request(http_conn_t *c, struct tcp_pcb *pcb) {
+    // Route on the path without any query string; only /print interprets its
+    // query parameters (below). An empty or absent query is treated alike for
+    // every other endpoint (their query text is simply ignored).
+    const char *query = NULL;
+    char *qm = strchr(c->path, '?');
+    if (qm != NULL) {
+        *qm = '\0';
+        query = qm + 1;
+    }
+
     if (strcmp(c->method, "POST") == 0 && strcmp(c->path, "/write") == 0) {
         handle_write(c, pcb);
     } else if (strcmp(c->method, "OPTIONS") == 0 && strcmp(c->path, "/write") == 0) {
         // CORS preflight for browser clients that POST to /write.
         respond_cors(c, pcb, "200 OK", "", 0);
     } else if (strcmp(c->method, "GET") == 0 && strcmp(c->path, "/print") == 0) {
-        handle_print(c, pcb);
+        // /print has one optional parameter: debug (=1) selects the full
+        // diagnostic document; any other query is a client mistake.
+        bool debug_mode = false;
+        if (query != NULL && query[0] != '\0') {
+            if (strcmp(query, "debug") == 0 || strcmp(query, "debug=1") == 0) {
+                debug_mode = true;
+            } else {
+                respond_err(c, pcb, "400 Bad Request", "{\"status\":\"error\",\"error\":\"unknown query\"}");
+                return;
+            }
+        }
+        handle_print(c, pcb, debug_mode);
     } else if (strcmp(c->path, "/sign") == 0) {
         // Ed25519 signing endpoint (see the section above). Like /write and
         // /clear, this path answers with Access-Control-Allow-* headers and
@@ -986,4 +1231,10 @@ bool web_server_init(void) {
 
     tcp_accept(pcb, web_accept_cb);
     return true;
+}
+
+void web_server_set_dhcp(const dhcp_server_t *d) {
+    // Read-only reference for the /print?debug=1 lease table; the caller
+    // (main.c) owns the dhcp_server_t and must keep it alive.
+    dbg_dhcp = d;
 }

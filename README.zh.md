@@ -31,7 +31,8 @@
 | 方法 | 路径 | 行为 |
 |------|------|------|
 | POST | `/write` | 发送 JSON 表单，如 `{"name":"alice","value":"hello"}`。提取配置字段（`web_server.c` 中的 `WRITE_FIELDS`，默认 `name`、`value`），**加密**后持久化到 flash。成功返回 `{"status":"ok","bytes":N,"pk":"<64位hex>","sk":"<64位hex>"}`：`pk`/`sk` 是本次写入记录的**清除回执**，请妥善保存。无效/空 body 返回 `400`；存储数据超过 2 KiB 返回 `413`。该端点带宽松 CORS 头（`Access-Control-Allow-Origin: *`）并支持 OPTIONS 预检，主机侧网页可跨域 POST 并读取响应。 |
-| GET  | `/print` | 以 `application/json` 返回已存储的数据（读取时实时解密）；无有效数据时返回 `{"status":"empty"}`。该端点仅在 `DEBUG=1`（`tusb_config.h`）时编译进固件，默认固件下返回 `404`。 |
+| GET  | `/print` | 以 `application/json` 返回已存储的数据（读取时实时解密）；无有效数据时返回 `{"status":"empty"}`。不加 CORS 头。 |
+| GET  | `/print?debug=1` | 返回**综合诊断文档**（见下）：固件信息、运行时间、复位原因、USB/网卡状态、存储状态（含解密后的记录）、HTTP 连接池、DHCP 租约与 lwIP 堆/池统计——绝不含任何密钥材料。不加 CORS 头。两种 `/print` 形式在 `DEBUG=1`（`tusb_config.h`，**默认 1**）时编译进固件；`DEBUG=0` 构建统一回 `404`；`/print` 携带其它 query 一律 `400`。 |
 | GET  | `/sign` | 端点描述：`{"endpoint":"/sign","method":"POST","fields":["challenge","context","timestamp"]}`。 |
 | POST | `/sign` | 用固件内置的 Ed25519 密钥对消息 `<challenge>:<context>:<timestamp>:device_001` 签名（自旧版固件迁移）。返回 `{"signature":"<base64>","timestamp":"<原样回显>","device_id":"device_001"}`；空 body/缺字段/格式错误返回 `400`。 |
 | POST | `/clear` | 擦除已存储的数据，但**只有 body 携带当前记录那次 `/write` 返回的完全相同的 `pk`/`sk`**（hex）时才会执行，如 `{"pk":"...","sk":"..."}`。完全一致 → `{"status":"ok"}`；不一致 → `403` 且数据保持不动；缺失/格式错误 → `400`；无有效记录 → `200`（幂等空操作）。该端点同样带宽松 CORS 头（`Access-Control-Allow-Origin: *`）并支持 OPTIONS 预检（须携带正确回执才会真正擦除）。 |
@@ -97,6 +98,41 @@ value。对固定 9 字符 `name` 的载荷，固定开销为 31 字节，因此
 JSON 会返回 `400`，不会静默改写数据。**Content-Length**：空或非数字的值返回
 `400`；溢出的值会饱和并返回 `413`，声明长度超过接收缓冲（约 3.1 KB）也同样立即
 返回 `413` 并关闭连接，而不是挂起到超时。
+
+### `GET /print?debug=1` 诊断文档
+
+返回一个 JSON 文档，汇总设备当前状态（绝不包含任何密钥材料）：
+
+```jsonc
+{
+  "firmware": { "name": "usbnet", "version": "0.1", "debug": 1, "board": "rp2040|rp2350|..." },
+  "uptime_s": 1234,
+  "reset_reason": "0x00000002",   // watchdog 复位原因寄存器
+  "usb":     { "link_up": true },
+  "netif":   { "up": true, "ip": "192.168.7.1", "netmask": "255.255.255.0",
+               "gw": "0.0.0.0", "mtu": 1514, "mac": "AA:BB:CC:DD:EE:FF" },
+  "storage": { "state": "empty|valid|other", "format_version": 1,
+               "payload_len": 123, "sections": 1,
+               "payload": { ... } | null },   // 有有效记录时为解密后的记录
+  "http":    { "max_conns": 2,
+               "connections": [ { "slot": 0, "active": true,
+                                  "phase": "receiving|complete|responded",
+                                  "buffered": 0, "idle": 0 } ] },
+  "dhcp":    { "enabled": true,
+               "leases": [ { "index": 0, "mac": "AA:BB:...", "expires_in_s": 86340 } ] },
+  "heap":    { "avail": 20480, "used": 3520, "max": 3520, "err": 0 }, // lwIP 堆
+  "pools":   [ { "name": "PBUF_POOL", "avail": 24, "used": 2, "max": 4, "err": 0 } ]
+}
+```
+
+- `storage.state`：`empty`（已擦除）、`valid`（记录可读）、`other`（旧格式/
+  半截写入/损坏——对外按空处理）。
+- `payload` 即 /write 存入的 JSON 文档，与 `GET /print` 的返回逐字节一致；
+  无有效记录时为 `null`。
+- `leases` 来自开机时注册的 DHCP 服务器；未分配过租约则为空。
+  `expires_in_s` 为近似值。
+- 堆/池数字是 lwIP 自身的记账（MEM_STATS/MEMP_STATS），反映内存压力而非
+  整颗芯片 SRAM 的全貌。
 
 ## 存储与加密
 
@@ -169,8 +205,8 @@ python stress_test.py --help             # 查看全部选项
 `--pk`/`--sk`（预检无法清除的旧记录会被探测写入覆盖）。`-s` 超过上限会在
 启动时直接拒绝，避免注定失败配置刷出成片 `413`。注意：对写入数据的逐字节校验
 只在 `--workers 1` 下有意义。工具通过 `GET /print` 校验写入，而该端点只在
-`DEBUG=1`（`tusb_config.h`）的固件中存在；默认 `DEBUG=0` 固件下预检会以明确
-提示中止。
+`DEBUG=1`（`tusb_config.h`，默认开启）的固件中存在；`DEBUG=0` 固件下预检会
+以明确提示中止。预检还会校验新的 `GET /print?debug=1` 诊断端点。
 
 ## 构建
 
@@ -202,9 +238,10 @@ make -j$(nproc)
 
 - 协议切换：`tusb_config.h` 的 `USE_ECM`（0 = CDC-NCM，适合 iOS / Windows 11；
   1 = ECM + RNDIS，适合 Windows / macOS）。
-- 调试读回：`tusb_config.h` 中的 `DEBUG`（默认 0）。HTTP `GET /print`
-  端点（读回已存储记录）仅在 `DEBUG=1` 时编译进固件；`DEBUG=0` 时该路径返回
-  `404`。需要读回数据时请以 `DEBUG=1` 构建固件。
+- 调试接口：`tusb_config.h` 中的 `DEBUG`（**默认 1**）。开启时，`GET /print`
+  返回已存储记录，`GET /print?debug=1` 返回综合
+  诊断文档（固件/运行时间/复位原因/USB 与网卡状态/存储状态与解密载荷/HTTP
+  连接池/DHCP 租约/lwIP 堆池统计）。`DEBUG=0` 时两种形式都回 `404`。
 - 字段配置：`web_server.c` 中的 `WRITE_FIELDS`（默认为 `name`、`value`）。
 - `flash_program.c` 是官方 flash 读写示例，仅作参考，**不参与编译**（它自带
   `main`）。
@@ -225,8 +262,11 @@ make -j$(nproc)
   伪造 `device_001` 的签名。该端点仅为兼容旧版固件的既有验签方而保留，
   **不可用作设备认证**。
 - **`/write` 带宽松 CORS 且无需回执**：主机访问过的任意网页都能覆写存储
-  记录（属数据破坏，不泄露机密）；`/clear` 仍须回执、`/print` 不加 CORS 且
-  需 `DEBUG=1` 构建才能读回。
+  记录（属数据破坏，不泄露机密）；`/clear` 仍须回执，`/print`（含
+  `/print?debug=1`）不加 CORS 头。由于 `DEBUG` 默认开启，出厂固件即暴露
+  读回能力；需要最小暴露面时把 `tusb_config.h` 中的 `DEBUG` 改为 0 即可关闭
+  整个调试接口（不要用全局 `-DDEBUG` 编译参数：Pico SDK 自身使用了名为
+  `DEBUG` 的宏，例如其软件自旋锁选择逻辑，全局定义会破坏 SDK 构建）。
 - 每次写入的 crypto_box 密钥/nonce 由 `pico_rand` 产生：RP2350 上是硬件
   TRNG，RP2040 上是 ROSC 环形振荡器派生的伪随机源（非真熵源）。对本文的
   威胁模型够用，不宜用于长期密钥保护。

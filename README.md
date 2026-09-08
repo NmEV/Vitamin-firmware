@@ -39,7 +39,8 @@ contain a `Content-Length` header.
 | Method | Path    | Behavior |
 |--------|---------|----------|
 | POST   | `/write` | Sends a JSON form, e.g. `{"name":"alice","value":"hello"}`. The configured fields (`WRITE_FIELDS` in `web_server.c`, default `name` and `value`) are extracted and **encrypted**, then persisted to flash. Returns `{"status":"ok","bytes":N,"pk":"<64 hex>","sk":"<64 hex>"}`: `pk`/`sk` are the **clear receipt** of the record just written — keep them. `400` on an invalid/empty body, `413` if the stored data exceeds 2 KiB. CORS-enabled (`Access-Control-Allow-Origin: *`, OPTIONS preflight) so browser apps on the host can POST and read the response. |
-| GET    | `/print` | Returns the stored data as `application/json` (decrypted on the fly), or `{"status":"empty"}` if nothing valid is stored. Only compiled in when `DEBUG=1` (`tusb_config.h`); default builds answer `404`. |
+| GET    | `/print` | Returns the stored data as `application/json` (decrypted on the fly), or `{"status":"empty"}` if nothing valid is stored. No CORS headers. |
+| GET    | `/print?debug=1` | Full **diagnostic document** (see below): firmware info, uptime, reset reason, USB/netif state, storage state incl. the decrypted payload, HTTP connection pool, DHCP leases and lwIP heap/pool statistics — never any key material. No CORS headers. Both `/print` forms are compiled in when `DEBUG=1` (`tusb_config.h`, **default 1**); a `DEBUG=0` build answers `404`. Any other query on `/print` answers `400`. |
 | GET    | `/sign` | Endpoint description: `{"endpoint":"/sign","method":"POST","fields":["challenge","context","timestamp"]}`. |
 | POST   | `/sign` | Ed25519-signs the message `<challenge>:<context>:<timestamp>:device_001` with the firmware's embedded key (migrated from the legacy firmware). Returns `{"signature":"<base64>","timestamp":"<echoed>","device_id":"device_001"}`. `400` on an empty/missing/malformed field. |
 | POST   | `/clear` | Erases the stored data, but **only when the body carries the exact `pk`/`sk`** (hex) that the `/write` of the current record returned, e.g. `{"pk":"...","sk":"..."}`. Exact match → `{"status":"ok"}`; mismatch → `403` and the data stays untouched; missing/malformed pair → `400`; nothing valid stored → `200` (idempotent no-op). CORS-enabled (`Access-Control-Allow-Origin: *`, OPTIONS preflight) like `/write`. |
@@ -115,6 +116,42 @@ rejected with `400` instead of silently corrupting the value.
 overflowing value saturates and is rejected with `413`, as is any declared
 length beyond the receive buffer (~3.1 KB) — in both cases the connection is
 closed immediately instead of hanging until the poll timeout.
+
+### `GET /print?debug=1` diagnostic document
+
+Returns one JSON document with the device's current state (no key material
+is ever included):
+
+```jsonc
+{
+  "firmware": { "name": "usbnet", "version": "0.1", "debug": 1, "board": "rp2040|rp2350|..." },
+  "uptime_s": 1234,
+  "reset_reason": "0x00000002",   // watchdog reset-reason register
+  "usb":     { "link_up": true },
+  "netif":   { "up": true, "ip": "192.168.7.1", "netmask": "255.255.255.0",
+               "gw": "0.0.0.0", "mtu": 1514, "mac": "AA:BB:CC:DD:EE:FF" },
+  "storage": { "state": "empty|valid|other", "format_version": 1,
+               "payload_len": 123, "sections": 1,
+               "payload": { ... } | null },   // decrypted record when valid
+  "http":    { "max_conns": 2,
+               "connections": [ { "slot": 0, "active": true,
+                                  "phase": "receiving|complete|responded",
+                                  "buffered": 0, "idle": 0 } ] },
+  "dhcp":    { "enabled": true,
+               "leases": [ { "index": 0, "mac": "AA:BB:...", "expires_in_s": 86340 } ] },
+  "heap":    { "avail": 20480, "used": 3520, "max": 3520, "err": 0 }, // lwIP heap
+  "pools":   [ { "name": "PBUF_POOL", "avail": 24, "used": 2, "max": 4, "err": 0 } ]
+}
+```
+
+- `storage.state`: `empty` (erased), `valid` (record readable), `other`
+  (older format / partial write / corruption — treated as empty by the API).
+- `payload` is the stored JSON document, byte-identical to what a plain
+  `GET /print` returns; `null` when nothing valid is stored.
+- `leases` come from the DHCP server registered at boot; empty when no
+  lease was handed out. `expires_in_s` is an approximation.
+- The heap/pool numbers are lwIP's own accounting (MEM_STATS/MEMP_STATS);
+  they show memory pressure, not the full SRAM picture.
 
 ## Storage & encryption
 
@@ -204,9 +241,10 @@ record the preflight cannot clear is overwritten by its probe write). `-s`
 above the limit is refused at startup, so a doomed configuration cannot
 produce a stream of `413`s. Note: byte-for-byte verification of written data
 is only meaningful with `--workers 1`. The tool verifies writes through
-`GET /print`, which only exists in `DEBUG=1` builds (`tusb_config.h`);
-against a default (`DEBUG=0`) firmware its preflight aborts with a clear
-message.
+`GET /print`, which exists in `DEBUG=1` builds (`tusb_config.h`, the
+default); against a `DEBUG=0` firmware its preflight aborts with a clear
+message. The preflight also checks the new `GET /print?debug=1` diagnostic
+endpoint.
 
 ## Building
 
@@ -241,10 +279,12 @@ the CI overrides it to `pico2`.
 
 - Protocol: `USE_ECM` in `tusb_config.h` (0 = CDC-NCM for iOS/Windows 11,
   1 = ECM + RNDIS for Windows/macOS).
-- Debug read-back: `DEBUG` in `tusb_config.h` (default 0). The HTTP
-  `GET /print` endpoint (read-back of the stored record) is only compiled in
-  when `DEBUG=1`; with `DEBUG=0` the path answers `404`. Build a
-  `DEBUG=1` image when you need to read the stored data back.
+- Debug interface: `DEBUG` in `tusb_config.h` (**default 1**). When enabled,
+  the HTTP `GET /print` endpoint returns the stored record
+  and `GET /print?debug=1` returns a full diagnostic document (firmware,
+  uptime, reset reason, USB/netif state, storage state with the decrypted
+  payload, HTTP connection pool, DHCP leases, lwIP heap/pool stats). With
+  `DEBUG` set to 0 in `tusb_config.h` both forms answer `404`.
 - Fields: `WRITE_FIELDS` in `web_server.c` (defaults to `name`, `value`).
 - `flash_program.c` is the upstream reference for the flash write/read
   pattern and is **not part of the build** (it has its own `main`).
@@ -272,7 +312,10 @@ the CI overrides it to `pico2`.
 - **`/write` is CORS-open (`Access-Control-Allow-Origin: *`) and needs no
   receipt**: any website visited by the host can overwrite the stored record
   (data loss, not a secrecy leak). `/clear` still requires the receipt and
-  `/print` sends no CORS headers; read-back needs a `DEBUG=1` build.
+  `/print` (and `/print?debug=1`) send no CORS headers. Because `DEBUG`
+  defaults to 1, the stock firmware exposes read-back; set `DEBUG` to 0 in
+  `tusb_config.h` to disable the whole debug interface (a global `-DDEBUG`
+  flag must not be used: the Pico SDK keys on the `DEBUG` token itself).
 - Randomness for the per-write crypto_box keys/nonces comes from `pico_rand`:
   on RP2350 that is the hardware TRNG, on RP2040 it is derived from the ROSC
   ring oscillator (not a true entropy source). Fine for this threat model,

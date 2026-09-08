@@ -53,4 +53,25 @@ bool storage_write(const uint8_t *src, size_t len, uint8_t out_pk[32], uint8_t o
 // success.
 bool storage_clear(void);
 
+// ---------------------------------------------------------------------------
+// Diagnostic state query (used by the /print?debug=1 interface). Exposes the
+// slot state and the plaintext-length bookkeeping from the record header only:
+// no key material, nonce or ciphertext is ever returned.
+// ---------------------------------------------------------------------------
+typedef enum {
+    STORAGE_STATE_EMPTY = 0, // erased (0xFF) or nothing written yet
+    STORAGE_STATE_VALID,     // magic + format version match and length is sane
+    STORAGE_STATE_OTHER      // bytes present but magic/version/length do not
+                             // match (older format, partial write, corruption)
+} storage_state_t;
+
+typedef struct {
+    storage_state_t state;
+    uint8_t format_version; // raw header version byte (0xFF when erased)
+    uint32_t payload_len;   // meaningful only when state == STORAGE_STATE_VALID
+} storage_info_t;
+
+// Fills *out with the current slot state. Returns true on success.
+bool storage_get_info(storage_info_t *out);
+
 #endif // STORAGE_H

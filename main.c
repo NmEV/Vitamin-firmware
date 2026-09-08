@@ -35,6 +35,8 @@ int main() {
     printf("failed to start web server\n");
   } else {
     printf("web server listening on port 80\n");
+    // let the /print?debug=1 interface report the DHCP lease table
+    web_server_set_dhcp(&dhcp_server);
   }
 
   // enter main loop

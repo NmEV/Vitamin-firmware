@@ -292,14 +292,34 @@ def preflight_checks(base, args, tally):
     """
     ok_all = True
 
-    # GET /print only exists in firmware built with DEBUG=1 (tusb_config.h).
-    # Detect a DEBUG=0 build up front, so the rest of the checks do not turn
-    # into a wall of confusing 404 failures.
+    # GET /print only exists in firmware built with DEBUG=1 (tusb_config.h,
+    # the default). Detect an explicitly DEBUG=0 build up front, so the rest
+    # of the checks do not turn into a wall of confusing 404 failures.
     status, _ = http_call(base, "GET", "/print", None, args.timeout)
     if status == 404:
-        print("[Preflight] FAIL: firmware has no /print endpoint (tusb_config.h "
-              "DEBUG=0); set DEBUG=1 and reflash to run this tool")
+        print("[Preflight] FAIL: firmware has no /print endpoint (DEBUG set to "
+              "0 in tusb_config.h); rebuild with DEBUG=1")
         return False, None
+
+    # The debug diagnostic endpoint must answer with one parseable document
+    # carrying the core sections, and must reject unknown query parameters.
+    status, body = http_call(base, "GET", "/print?debug=1", None, args.timeout)
+    if status != 200 or not valid_json(body):
+        ok_all = False
+        print(f"[Preflight] FAIL: /print?debug=1 -> {status} {body[:120]!r}"
+              f" (expected 200 + JSON diagnostic document)")
+    else:
+        doc = json.loads(body.decode("utf-8"))
+        missing = [k for k in ("firmware", "uptime_s", "storage", "http", "netif")
+                   if k not in doc]
+        if missing or doc.get("storage", {}).get("state") not in ("empty", "valid", "other"):
+            ok_all = False
+            print(f"[Preflight] FAIL: /print?debug=1 document missing keys or bad "
+                  f"storage.state: {missing} {doc.get('storage')!r}")
+    status, _ = http_call(base, "GET", "/print?debug=garbage", None, args.timeout)
+    if status != 400:
+        ok_all = False
+        print(f"[Preflight] FAIL: /print?debug=garbage -> {status} (expected 400)")
 
     # A stray GET must never wipe the record: it is answered 405.
     status, _ = http_call(base, "GET", "/clear", None, args.timeout)

@@ -46,10 +46,27 @@
 #define LWIP_NETIF_LINK_CALLBACK 1
 #define LWIP_NETIF_HOSTNAME 1
 #define LWIP_NETCONN 0
-#define MEM_STATS 0
+// lwIP statistics: the /print?debug=1 interface reports heap/pool pressure.
+// LWIP_STATS must be on for the counters to exist; every per-protocol stat is
+// explicitly off so the cost stays at a few counters updated per alloc/free
+// (plus RAM for the structs), with no display code compiled in.
+#define LWIP_STATS 1
+#define MEM_STATS 1
+#define MEMP_STATS 1
 #define SYS_STATS 0
-#define MEMP_STATS 0
 #define LINK_STATS 0
+#define ETHARP_STATS 0
+#define IPFRAG_STATS 0
+#define IP_STATS 0
+#define ICMP_STATS 0
+#define IGMP_STATS 0
+#define UDP_STATS 0
+#define TCP_STATS 0
+#define IP6_STATS 0
+#define ICMP6_STATS 0
+#define MLD6_STATS 0
+#define ND6_STATS 0
+#define MIB2_STATS 0
 // #define ETH_PAD_SIZE                2
 #define LWIP_CHKSUM_ALGORITHM 3
 #define LWIP_DHCP 1
@@ -72,8 +89,7 @@
 
 #ifndef NDEBUG
 #define LWIP_DEBUG 1
-#define LWIP_STATS 1
-#define LWIP_STATS_DISPLAY 1
+#define LWIP_STATS_DISPLAY 1 // stats are enabled unconditionally above
 #endif
 
 #define ETHARP_DEBUG LWIP_DBG_OFF

@@ -120,12 +120,22 @@ extern "C" {
 // Project feature switch (read by the web server and other app code)
 //--------------------------------------------------------------------
 
-// When 1 the HTTP GET /print endpoint (read-back of the stored record) is
-// compiled into the web server; when 0 (the default) the endpoint is absent
-// and GET /print is answered 404 like any unknown path. Debug builds can
-// override this with -DDEBUG=1 on the command line.
+// When 1 (the default) the web server compiles in the debug interface:
+//   GET /print          read-back of the stored record (decrypted on the fly)
+//   GET /print?debug=1  full diagnostic document (device/storage/network/
+//                       runtime state, no key material)
+// When 0 both forms are absent and GET /print is answered 404 like any
+// unknown path. This header is the single switch: do NOT pass -DDEBUG=0/1 on
+// the command line, the Pico SDK itself keys on a preprocessor symbol named
+// DEBUG (e.g. its software spin-lock selection), so a global -DDEBUG flag
+// breaks the SDK build. Edit the default below instead.
+//
+// Note: with the debug interface enabled the default firmware lets anyone on
+// the USB host read the stored data back. /print deliberately sends no CORS
+// headers (a random web page cannot read the response), but any local process
+// can. Set DEBUG to 0 here when the device must not expose read-back.
 #ifndef DEBUG
-#define DEBUG 0
+#define DEBUG 1
 #endif
 
 #ifdef __cplusplus
