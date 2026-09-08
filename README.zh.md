@@ -180,7 +180,11 @@ ARM GCC 14.2.rel1 + Pico SDK 2.3.0（与本地 VS Code 环境一致；工具链�
 `main`/`master` 或手动触发。产物 `usbnet-firmware-pico` /
 `usbnet-firmware-pico2` 各是一个 zip，内含 `build/usbnet.uf2`（烧这个）、
 `build/usbnet.elf`、`build/usbnet.bin` 与 `build/usbnet.map`。若固件体积长到
-侵入 256 KB 存储槽位，CI 会直接失败。
+侵入 256 KB 存储槽位，CI 会直接失败。`main`/`master` 上的每次成功构建还会把
+产物滚动发布为一个 GitHub **Release**，使用单一固定 tag（env `RELEASE_TAG`，
+默认 `usbnet-firmware`）：旧 release/tag 会被替换，因此 Release 下载链接保持
+稳定且始终指向最新固件（`usbnet-pico.uf2` / `usbnet-pico2.uf2` 及按板分装
+的 zip）。不推送也可以手动触发 workflow 来发布某个分支的构建。
 
 本地开发：使用树莓派 Pico VS Code 扩展（`CMakeLists.txt` 已配置，SDK 2.3.0 +
 GCC 14.2），或手动构建：

@@ -217,7 +217,12 @@ push/PR to `main`/`master` or manually; the toolchain and SDK are cached
 between runs. Artifacts `usbnet-firmware-pico` / `usbnet-firmware-pico2` are
 zips containing `build/usbnet.uf2` (flash this one), `build/usbnet.elf`,
 `build/usbnet.bin` and `build/usbnet.map`. CI also fails the build if the
-firmware grows into the 256 KB flash slot used by storage.
+firmware grows into the 256 KB flash slot used by storage. Every successful
+build on `main`/`master` additionally publishes a GitHub **Release** under one
+fixed tag (env `RELEASE_TAG`, default `usbnet-firmware`): the previous
+release/tag is replaced, so the Release URL is stable and always carries the
+newest firmware (`usbnet-pico.uf2` / `usbnet-pico2.uf2` plus per-board zips).
+Run the workflow manually to publish a branch build without a push.
 
 Locally: use the Raspberry Pi Pico VS Code extension (configured in
 `CMakeLists.txt`, SDK 2.3.0 + GCC 14.2), or build manually:

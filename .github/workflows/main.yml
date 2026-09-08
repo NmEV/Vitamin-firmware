@@ -14,6 +14,11 @@ env:
   SDK_VERSION: 2.3.0
   TOOLCHAIN_VERSION: 14.2.rel1
   TOOLCHAIN_DIR_NAME: arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi
+  # FIXED tag under which the release job publishes the compiled firmware.
+  # Every build on main/master replaces the release with this name (old
+  # release + tag are deleted and recreated at the new commit), so the
+  # download URL stays stable and always points at the newest firmware.
+  RELEASE_TAG: usbnet-firmware
 
 jobs:
   build:
@@ -107,3 +112,84 @@ jobs:
           build/*.elf
           build/*.bin
           build/usbnet.map
+
+  # ---------------------------------------------------------------------------
+  # Publish compiled firmware to a GitHub Release under one FIXED tag
+  # (env.RELEASE_TAG, above). Runs after the build for every push to
+  # main/master and for manual workflow_dispatch runs: the previous release
+  # and tag are removed first (GitHub refuses to move a tag that still has a
+  # release attached), then the release is recreated at the current commit.
+  # Asset names are stable per board (usbnet-pico.uf2 / usbnet-pico2.uf2), so
+  # a script can always download "the latest firmware" from the same URL.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish rolling firmware Release
+    if: (github.event_name == 'workflow_dispatch') || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: firmware-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download pico build
+        uses: actions/download-artifact@v4
+        with:
+          name: usbnet-firmware-pico
+          path: artifacts/pico
+
+      - name: Download pico2 build
+        uses: actions/download-artifact@v4
+        with:
+          name: usbnet-firmware-pico2
+          path: artifacts/pico2
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          # Convenience top-level files (the .uf2 is what you flash), plus the
+          # original per-board zips with elf/bin/map for debugging.
+          cp artifacts/pico/build/usbnet.uf2  assets/usbnet-pico.uf2
+          cp artifacts/pico/build/usbnet.elf  assets/usbnet-pico.elf
+          cp artifacts/pico/build/usbnet.map  assets/usbnet-pico.map
+          cp artifacts/pico2/build/usbnet.uf2 assets/usbnet-pico2.uf2
+          cp artifacts/pico2/build/usbnet.elf assets/usbnet-pico2.elf
+          cp artifacts/pico2/build/usbnet.map assets/usbnet-pico2.map
+          (cd artifacts/pico  && zip -qr ../usbnet-firmware-pico.zip  build)
+          (cd artifacts/pico2 && zip -qr ../usbnet-firmware-pico2.zip build)
+          ls -l assets artifacts/*.zip
+
+      - name: Remove previous fixed-tag release
+        run: |
+          set -euo pipefail
+          # Deleting the release also cleans up the tag if --cleanup-tag is
+          # given; a leftover tag without a release is removed via the API.
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" 2>/dev/null || true
+
+      - name: Create release
+        run: |
+          set -euo pipefail
+          short_sha=$(echo "$GITHUB_SHA" | cut -c1-8)
+          date_str=$(date -u +%Y-%m-%d)
+          {
+            echo "**Built from** [$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) ($date_str)"
+            echo ""
+            echo 'Flash with BOOTSEL held: drag usbnet-pico.uf2 (RP2040) or usbnet-pico2.uf2 (RP2350) onto the RPI-RP2 drive.'
+            echo ""
+            echo 'The *.zip assets contain the ELF/BIN/MAP for the matching build (debugging / layout checks).'
+            echo ""
+            echo "This release is rolling: the $RELEASE_TAG tag is force-moved to the newest main/master build,"
+            echo "so this page always shows the latest firmware."
+          } > notes.md
+          gh release create "$RELEASE_TAG" assets/usbnet-pico.uf2 assets/usbnet-pico2.uf2 \
+            assets/usbnet-pico.elf assets/usbnet-pico2.elf \
+            assets/usbnet-pico.map assets/usbnet-pico2.map \
+            artifacts/usbnet-firmware-pico.zip artifacts/usbnet-firmware-pico2.zip \
+            --target "$GITHUB_SHA" \
+            --title "usbnet firmware $short_sha ($date_str)" \
+            --notes-file notes.md
